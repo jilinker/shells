@@ -2,7 +2,9 @@
 
 ## Scope
 
-Extend `linux_security_manager.sh` with SSH security management and Fail2Ban management while preserving the existing UFW implementation
+Create a standalone `linux_security.sh` with SSH security management Fail2Ban management and the complete existing UFW implementation
+
+The new script does not source call or modify `linux_security_manager.sh`
 
 System security inspection remains unimplemented
 
@@ -11,7 +13,7 @@ System security inspection remains unimplemented
 - Require root when the script starts and exit with a clear message otherwise
 - Support Debian and Ubuntu systems using `apt-get` and systemd
 - Check and install missing packages only after the user enters the relevant module and confirms installation
-- Keep all management in the existing script and add only a minimal runnable self check
+- Keep all management in the standalone script and add only a minimal runnable self check
 
 ## SSH management
 
@@ -117,7 +119,7 @@ Configuration is checked with `fail2ban-client -t` before the service is restart
 
 ## Existing UFW integration
 
-The current UFW module remains the single implementation for firewall management
+The new script inherits the complete current UFW module for firewall management
 
 SSH port migration reuses its existing validation and rule helpers where possible and tags any rules it creates so cleanup cannot delete unrelated user rules
 
@@ -133,3 +135,14 @@ The reference script's separate UFW setup flow is not copied
 - A small shell self check covers pure validation state and configuration rendering logic without changing the host system
 - `bash -n` and ShellCheck are run when available
 
+## Remote execution
+
+The repository documents one command that always fetches `linux_security.sh` from the `main` branch through `raw.githubusercontent.com`
+
+The command uses `curl` when available and falls back to `wget` otherwise
+
+It validates the downloader exit status stores the script only in memory and executes it through Bash process substitution so interactive input remains attached to the terminal
+
+The command does not elevate privileges and the downloaded script keeps the existing root check
+
+The command is documented in `README.md` and as one usage line near the top of `linux_security.sh`
