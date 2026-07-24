@@ -240,6 +240,40 @@ ssh_effective_config_hardened "${hardened_config/prohibit-password/without-passw
 assert_fails ssh_effective_config_hardened "${hardened_config/passwordauthentication no/passwordauthentication yes}"
 assert_fails ssh_effective_config_hardened "${hardened_config/maxauthtries 3/maxauthtries 4}"
 
+UFW_CALL_LOG="$TEST_TMP/ufw-call-log"
+UFW_FAKE_FAIL=no
+ufw() {
+    printf '%s\n' "$*" >> "$UFW_CALL_LOG"
+    [[ "$UFW_FAKE_FAIL" == no ]] || return 1
+    case "$*" in
+        'status numbered') printf '%s\n' 'Status: active' '[ 1] 22/tcp ALLOW IN Anywhere' ;;
+        'status verbose') printf '%s\n' 'Status: active' 'Default: deny (incoming), allow (outgoing), deny (routed)' ;;
+        'show added') printf '%s\n' 'Added user rules (see ufw status)' 'ufw allow 22/tcp' ;;
+        *) return 1 ;;
+    esac
+}
+
+invalidate_ufw_snapshot
+ensure_ufw_snapshot
+assert_eq 3 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+ensure_ufw_snapshot
+assert_eq 3 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+ufw_snapshot_active
+assert_contains "$UFW_STATUS_NUMBERED_CACHE" '[ 1] 22/tcp ALLOW IN Anywhere'
+
+invalidate_ufw_snapshot
+ensure_ufw_snapshot
+assert_eq 6 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+
+invalidate_ufw_snapshot
+UFW_FAKE_FAIL=yes
+assert_fails ensure_ufw_snapshot >/dev/null 2>&1
+assert_eq 0 "$UFW_SNAPSHOT_READY"
+UFW_FAKE_FAIL=no
+: > "$UFW_CALL_LOG"
+ensure_ufw_snapshot
+assert_eq 3 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+
 sshd() {
     [[ ${1:-} == -T ]] || return 1
     printf '%s\n' "$hardened_config"

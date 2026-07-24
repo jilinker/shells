@@ -18,6 +18,10 @@ BEFORE_RULES="/etc/ufw/before.rules"
 NAT_BEGIN="# BEGIN UFW-RELAY-MANAGER RULES"
 NAT_END="# END UFW-RELAY-MANAGER RULES"
 UFW_JUST_INSTALLED=0
+UFW_SNAPSHOT_READY=0
+UFW_STATUS_NUMBERED_CACHE=
+UFW_STATUS_VERBOSE_CACHE=
+UFW_SHOW_ADDED_CACHE=
 SSH_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSH_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSH_PORT_CONFIG="${SSH_CONFIG_DIR}/99-security-manager-port.conf"
@@ -1025,6 +1029,41 @@ check_debian_family() {
 
 is_ufw_active() {
     ufw status 2>/dev/null | grep -q '^Status: active$'
+}
+
+# 清除 UFW 状态快照
+invalidate_ufw_snapshot() {
+    UFW_SNAPSHOT_READY=0
+    UFW_STATUS_NUMBERED_CACHE=
+    UFW_STATUS_VERBOSE_CACHE=
+    UFW_SHOW_ADDED_CACHE=
+}
+
+# 刷新 UFW 状态快照
+refresh_ufw_snapshot() {
+    local numbered verbose added
+    if ! numbered=$(ufw status numbered 2>&1) \
+        || ! verbose=$(ufw status verbose 2>&1) \
+        || ! added=$(ufw show added 2>&1); then
+        invalidate_ufw_snapshot
+        error "UFW 状态读取失败"
+        return 1
+    fi
+    UFW_STATUS_NUMBERED_CACHE=$numbered
+    UFW_STATUS_VERBOSE_CACHE=$verbose
+    UFW_SHOW_ADDED_CACHE=$added
+    UFW_SNAPSHOT_READY=1
+}
+
+# 确保 UFW 状态快照可用
+ensure_ufw_snapshot() {
+    (( UFW_SNAPSHOT_READY == 1 )) || refresh_ufw_snapshot
+}
+
+# 检查快照中的 UFW 状态
+ufw_snapshot_active() {
+    ensure_ufw_snapshot || return 1
+    grep -q '^Status: active$' <<< "$UFW_STATUS_NUMBERED_CACHE"
 }
 
 install_ufw_if_needed() {
