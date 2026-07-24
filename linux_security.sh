@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.2.1"
+VERSION="3.3.0"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
