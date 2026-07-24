@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.1.0"
+VERSION="3.1.1"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -66,7 +66,7 @@ install_lsec_candidate() {
 
     if is_streamed_source "$source"; then
         staged=$(mktemp) || return 1
-        if ! cp "$source" "$staged"; then
+        if ! download_lsec_candidate "$staged"; then
             rm -f "$staged"
             return 1
         fi

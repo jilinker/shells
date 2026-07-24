@@ -101,6 +101,12 @@ FAKE_CURL_SOURCE="$ROOT_DIR/linux_security.sh"
 download_lsec_candidate "$TEST_TMP/downloaded"
 validate_lsec_candidate "$TEST_TMP/downloaded"
 
+exec 9< "$ROOT_DIR/linux_security.sh"
+cat <&9 >/dev/null
+install_lsec_candidate /dev/fd/9
+exec 9<&-
+cmp -s "$ROOT_DIR/linux_security.sh" "$INSTALL_PATH"
+
 printf 'invalid\n' > "$TEST_TMP/invalid"
 FAKE_CURL_SOURCE="$TEST_TMP/invalid"
 installed_before=$(hash_file "$INSTALL_PATH")
@@ -141,9 +147,6 @@ assert_fails test -e "$INSTALL_PATH"
 usage=$(show_lsec_usage)
 assert_contains "$usage" 'lsec upgrade'
 assert_contains "$usage" 'lsec uninstall'
-
-install_lsec_candidate <(cat "$ROOT_DIR/linux_security.sh")
-cmp -s "$ROOT_DIR/linux_security.sh" "$INSTALL_PATH"
 
 validate_port 22
 assert_fails validate_port 0
