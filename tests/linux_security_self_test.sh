@@ -14,6 +14,7 @@ grep -Fq "$remote_url" "$ROOT_DIR/README.md"
 grep -Fq "bash <(curl -fsSL $remote_url)" "$ROOT_DIR/README.md"
 grep -Fq "bash <(wget -qO- $remote_url)" "$ROOT_DIR/README.md"
 grep -Fq "$remote_url" "$ROOT_DIR/linux_security.sh"
+grep -Fq 'VERSION="3.2.1"' "$ROOT_DIR/linux_security.sh"
 
 # 断言命令失败
 assert_fails() {
@@ -233,8 +234,9 @@ assert_eq 1 "$SECURITY_PASS_COUNT"
 assert_eq 1 "$SECURITY_WARNING_COUNT"
 assert_eq 1 "$SECURITY_UNKNOWN_COUNT"
 
-hardened_config=$'permitrootlogin prohibit-password\npubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no\nmaxauthtries 3\nlogingracetime 30'
+hardened_config=$'port 2222\npermitrootlogin prohibit-password\npubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no\nmaxauthtries 3\nlogingracetime 30'
 ssh_effective_config_hardened "$hardened_config"
+ssh_effective_config_hardened "${hardened_config/prohibit-password/without-password}"
 assert_fails ssh_effective_config_hardened "${hardened_config/passwordauthentication no/passwordauthentication yes}"
 assert_fails ssh_effective_config_hardened "${hardened_config/maxauthtries 3/maxauthtries 4}"
 
@@ -244,7 +246,7 @@ sshd() {
 }
 ssh_service_name() { echo ssh.service; }
 has_valid_authorized_key() { return 0; }
-all_current_ssh_ports() { echo 2222; }
+all_current_ssh_ports() { echo 22; }
 port_is_listening() { [[ $1 == 2222 ]]; }
 ss() { return 0; }
 is_ufw_active() { return 0; }
@@ -252,7 +254,7 @@ systemd_unit_loaded() { return 0; }
 ufw() { return 0; }
 fail2ban-client() { return 0; }
 systemctl() {
-    if [[ "$*" == *docker* ]]; then
+    if [[ "$*" == *docker* || "$*" == *ssh.socket* ]]; then
         return 1
     fi
     return 0

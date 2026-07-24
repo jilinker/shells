@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.2.0"
+VERSION="3.2.1"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -542,7 +542,7 @@ show_ssh_status() {
 ssh_effective_config_hardened() {
     local config=$1
     local max_tries grace_time
-    grep -qx 'permitrootlogin prohibit-password' <<< "$config" || return 1
+    grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "$config" || return 1
     grep -qx 'pubkeyauthentication yes' <<< "$config" || return 1
     grep -qx 'passwordauthentication no' <<< "$config" || return 1
     grep -qx 'kbdinteractiveauthentication no' <<< "$config" || return 1
@@ -2188,7 +2188,12 @@ security_check_root_key() {
 security_check_ssh_ports() {
     local ports port
     command -v ss >/dev/null 2>&1 || { record_security_check unknown "缺少 ss 无法检查 SSH 监听端口"; return 0; }
-    ports=$(all_current_ssh_ports 2>/dev/null || true)
+    if ssh_socket_managed; then
+        ports=$(detect_ssh_socket_ports 2>/dev/null || true)
+    else
+        command -v sshd >/dev/null 2>&1 || { record_security_check unknown "无法确定 SSH 配置端口"; return 0; }
+        ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n -u)
+    fi
     [[ -n "$ports" ]] || { record_security_check unknown "无法确定 SSH 监听端口"; return 0; }
     while IFS= read -r port; do
         port_is_listening "$port" || { record_security_check warning "SSH 端口 ${port} 未监听"; return 0; }
