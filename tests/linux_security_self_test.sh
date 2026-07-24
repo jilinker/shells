@@ -11,8 +11,8 @@ source "$ROOT_DIR/linux_security.sh"
 
 remote_url='https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh'
 grep -Fq "$remote_url" "$ROOT_DIR/README.md"
-grep -Fq 'command -v curl' "$ROOT_DIR/README.md"
-grep -Fq 'command -v wget' "$ROOT_DIR/README.md"
+grep -Fq "bash <(curl -fsSL $remote_url)" "$ROOT_DIR/README.md"
+grep -Fq "bash <(wget -qO- $remote_url)" "$ROOT_DIR/README.md"
 grep -Fq "$remote_url" "$ROOT_DIR/linux_security.sh"
 
 # 断言命令失败
@@ -62,6 +62,88 @@ assert_not_contains() {
         exit 1
     fi
 }
+
+# 计算文件哈希
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+configured_remote_url=$(env REMOTE_URL=https://example.invalid/linux_security.sh bash -c 'source "$1"; printf "%s\n" "$REMOTE_URL"' _ "$ROOT_DIR/linux_security.sh")
+assert_eq "$remote_url" "$configured_remote_url"
+
+INSTALL_PATH="$TEST_TMP/lsec"
+is_streamed_source /dev/fd/63
+is_streamed_source /proc/self/fd/10
+assert_fails is_streamed_source ./linux_security.sh
+validate_lsec_candidate "$ROOT_DIR/linux_security.sh"
+install_lsec_candidate "$ROOT_DIR/linux_security.sh"
+installed_mode=$(stat -f '%Lp' "$INSTALL_PATH" 2>/dev/null || stat -c '%a' "$INSTALL_PATH")
+assert_eq 755 "$installed_mode"
+cmp -s "$ROOT_DIR/linux_security.sh" "$INSTALL_PATH"
+
+# 模拟 curl 下载
+curl() {
+    local target=
+    while (( $# > 0 )); do
+        case "$1" in
+            -o) target=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    cp "$FAKE_CURL_SOURCE" "$target"
+}
+
+FAKE_CURL_SOURCE="$ROOT_DIR/linux_security.sh"
+download_lsec_candidate "$TEST_TMP/downloaded"
+validate_lsec_candidate "$TEST_TMP/downloaded"
+
+printf 'invalid\n' > "$TEST_TMP/invalid"
+FAKE_CURL_SOURCE="$TEST_TMP/invalid"
+installed_before=$(hash_file "$INSTALL_PATH")
+assert_fails upgrade_lsec >/dev/null 2>&1
+installed_after=$(hash_file "$INSTALL_PATH")
+assert_eq "$installed_before" "$installed_after"
+
+upgrade_candidate="$TEST_TMP/upgrade-candidate"
+cp "$ROOT_DIR/linux_security.sh" "$upgrade_candidate"
+printf '\n# upgraded candidate\n' >> "$upgrade_candidate"
+FAKE_CURL_SOURCE="$upgrade_candidate"
+upgrade_lsec >/dev/null
+cmp -s "$upgrade_candidate" "$INSTALL_PATH"
+
+FAKE_BIN="$TEST_TMP/fake-bin"
+mkdir -p "$FAKE_BIN"
+printf '%s\n' '#!/bin/bash' '/bin/cp "$FAKE_CURL_SOURCE" "$2"' > "$FAKE_BIN/wget"
+chmod +x "$FAKE_BIN/wget"
+unset -f curl
+original_path=$PATH
+PATH=$FAKE_BIN
+FAKE_CURL_SOURCE="$ROOT_DIR/linux_security.sh" download_lsec_candidate "$TEST_TMP/downloaded-by-wget"
+PATH=$original_path
+validate_lsec_candidate "$TEST_TMP/downloaded-by-wget"
+
+preserved_config="$TEST_TMP/preserved-config"
+touch "$preserved_config"
+remove_installed_lsec
+assert_fails test -e "$INSTALL_PATH"
+test -e "$preserved_config"
+test -e "$ROOT_DIR/linux_security.sh"
+
+install_lsec_candidate "$ROOT_DIR/linux_security.sh"
+printf 'n\n' | uninstall_lsec >/dev/null
+test -e "$INSTALL_PATH"
+printf 'y\n' | uninstall_lsec >/dev/null
+assert_fails test -e "$INSTALL_PATH"
+usage=$(show_lsec_usage)
+assert_contains "$usage" 'lsec upgrade'
+assert_contains "$usage" 'lsec uninstall'
+
+install_lsec_candidate <(cat "$ROOT_DIR/linux_security.sh")
+cmp -s "$ROOT_DIR/linux_security.sh" "$INSTALL_PATH"
 
 validate_port 22
 assert_fails validate_port 0

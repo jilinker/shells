@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Linux 服务器安全防护交互式管理器
 # 包含 UFW SSH 和 Fail2Ban 管理模块
-# 远程执行 bash -c 'u=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh; if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL "$u") || exit 1; elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- "$u") || exit 1; else echo "需要 curl 或 wget" >&2; exit 1; fi; bash <(printf "%s\n" "$s")'
+# 远程执行 bash <(curl -fsSL https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh)
 
 set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.0.0"
+VERSION="3.1.0"
+INSTALL_PATH=/usr/local/bin/lsec
+unset REMOTE_URL
+readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
+PROGRAM_MARKER='PROGRAM_NAME="Linux 服务器安全防护管理器"'
 STATE_DIR="/etc/ufw/relay-manager"
 STATE_FILE="${STATE_DIR}/forwarding.tsv"
 BEFORE_RULES="/etc/ufw/before.rules"
@@ -37,6 +41,121 @@ ok()    { printf "%b[成功]%b %s\n" "$GREEN" "$NC" "$*"; }
 warn()  { printf "%b[警告]%b %s\n" "$YELLOW" "$NC" "$*"; }
 error() { printf "%b[错误]%b %s\n" "$RED" "$NC" "$*" >&2; }
 die()   { error "$*"; exit 1; }
+
+# 检查流式脚本路径
+is_streamed_source() {
+    case ${1:-} in
+        /dev/fd/*|/proc/self/fd/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 校验 lsec 候选脚本
+validate_lsec_candidate() {
+    local file=$1
+    [[ -s "$file" ]] || return 1
+    grep -Fq "$PROGRAM_MARKER" "$file" || return 1
+    bash -n "$file"
+}
+
+# 原子安装 lsec 脚本
+install_lsec_candidate() {
+    local source=$1
+    local candidate=$source
+    local install_dir tmp staged=
+
+    if is_streamed_source "$source"; then
+        staged=$(mktemp) || return 1
+        if ! cp "$source" "$staged"; then
+            rm -f "$staged"
+            return 1
+        fi
+        candidate=$staged
+    fi
+
+    if ! validate_lsec_candidate "$candidate"; then
+        [[ -n "$staged" ]] && rm -f "$staged"
+        return 1
+    fi
+    install_dir=$(dirname "$INSTALL_PATH")
+    if ! install -d -m 755 "$install_dir"; then
+        [[ -n "$staged" ]] && rm -f "$staged"
+        return 1
+    fi
+    tmp=$(mktemp "${install_dir}/.lsec.XXXXXX") || {
+        [[ -n "$staged" ]] && rm -f "$staged"
+        return 1
+    }
+    if ! install -m 755 "$candidate" "$tmp" || ! mv -f "$tmp" "$INSTALL_PATH"; then
+        rm -f "$tmp"
+        [[ -n "$staged" ]] && rm -f "$staged"
+        return 1
+    fi
+    if [[ -n "$staged" ]]; then
+        rm -f "$staged"
+    fi
+    return 0
+}
+
+# 下载 lsec 候选脚本
+download_lsec_candidate() {
+    local target=$1
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REMOTE_URL" -o "$target"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$target" "$REMOTE_URL"
+    else
+        error "需要 curl 或 wget 才能升级"
+        return 1
+    fi
+}
+
+# 升级 lsec 脚本
+upgrade_lsec() {
+    local tmp version
+    tmp=$(mktemp) || return 1
+    if ! download_lsec_candidate "$tmp" \
+        || ! validate_lsec_candidate "$tmp" \
+        || ! install_lsec_candidate "$tmp"; then
+        rm -f "$tmp"
+        error "lsec 升级失败 已保留当前版本"
+        return 1
+    fi
+    version=$(awk -F '"' '$1 == "VERSION=" {print $2; exit}' "$tmp")
+    rm -f "$tmp"
+    ok "lsec 已升级到 ${version:-latest}"
+}
+
+# 删除 lsec 安装文件
+remove_installed_lsec() {
+    rm -f "$INSTALL_PATH"
+}
+
+# 卸载 lsec 脚本
+uninstall_lsec() {
+    if [[ ! -e "$INSTALL_PATH" ]]; then
+        info "lsec 当前未安装"
+        return 0
+    fi
+    warn "只会删除 ${INSTALL_PATH}"
+    warn "UFW SSH Fail2Ban 配置和状态都会保留"
+    confirm "确认卸载 lsec？" N || return 0
+    if ! remove_installed_lsec; then
+        error "lsec 卸载失败"
+        return 1
+    fi
+    ok "lsec 已卸载 系统安全配置保持不变"
+}
+
+# 显示 lsec 用法
+show_lsec_usage() {
+    cat <<'EOF'
+用法
+  lsec             打开安全管理菜单
+  lsec upgrade     升级到 main 最新版
+  lsec uninstall   卸载程序并保留系统配置
+EOF
+}
 
 pause() {
     read -r -p "按回车键继续..." _
@@ -2039,7 +2158,21 @@ main_menu() {
 
 main() {
     require_root || exit 1
-    main_menu
+
+    if is_streamed_source "${BASH_SOURCE[0]}"; then
+        info "正在安装 lsec 到 ${INSTALL_PATH}"
+        install_lsec_candidate "${BASH_SOURCE[0]}" || die "lsec 安装失败"
+        ok "lsec 安装完成"
+        exec "$INSTALL_PATH" "$@"
+    fi
+
+    case ${1:-} in
+        "") main_menu ;;
+        upgrade) upgrade_lsec ;;
+        uninstall) uninstall_lsec ;;
+        help|-h|--help) show_lsec_usage ;;
+        *) show_lsec_usage; return 2 ;;
+    esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

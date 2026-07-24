@@ -4,17 +4,29 @@
 
 ## 远程执行
 
-以下命令始终执行 GitHub `main` 分支的最新版本，不会把脚本保存到磁盘
+首次运行会安装到 `/usr/local/bin/lsec` 并立即打开菜单
 
 ```bash
-bash -c 'u=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh; if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL "$u") || exit 1; elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- "$u") || exit 1; else echo "需要 curl 或 wget" >&2; exit 1; fi; bash <(printf "%s\n" "$s")'
+bash <(curl -fsSL https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh)
+```
+
+没有 curl 时使用 wget
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh)
 ```
 
 脚本只允许 root 运行，非 root 会退出并提示使用 sudo
 
+安装后直接运行
+
 ```bash
-sudo bash -c 'u=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh; if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL "$u") || exit 1; elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- "$u") || exit 1; else echo "需要 curl 或 wget" >&2; exit 1; fi; bash <(printf "%s\n" "$s")'
+lsec
+lsec upgrade
+lsec uninstall
 ```
+
+`upgrade` 始终拉取 `main` 最新版，`uninstall` 只删除程序并保留全部安全配置
 
 远程执行会信任当时 `main` 分支中的内容，执行前可先在 GitHub 查看脚本
 
