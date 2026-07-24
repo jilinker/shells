@@ -1879,6 +1879,7 @@ rule_line_matches_direction() {
 show_saved_rules_when_inactive() {
     local direction=$1
     local line found=0
+    ensure_ufw_snapshot || return 1
 
     while IFS= read -r line; do
         [[ "$line" == ufw\ * ]] || continue
@@ -1896,7 +1897,7 @@ show_saved_rules_when_inactive() {
         esac
         printf '  %s\n' "$line"
         found=1
-    done < <(ufw show added 2>/dev/null || true)
+    done <<< "$UFW_SHOW_ADDED_CACHE"
 
     if (( found == 0 )); then
         echo "  暂无相关已保存规则"
@@ -1910,7 +1911,8 @@ show_direction_rules() {
 
     echo "--- ${title}现有配置 ---"
 
-    if ! is_ufw_active; then
+    ensure_ufw_snapshot || return 1
+    if ! ufw_snapshot_active; then
         warn "UFW 当前未启用，下面显示的是已保存配置；启用后才能按编号删除"
         show_saved_rules_when_inactive "$direction"
         echo
@@ -1923,7 +1925,7 @@ show_direction_rules() {
             printf '%s\n' "$line"
             found=1
         fi
-    done < <(ufw status numbered 2>/dev/null || true)
+    done <<< "$UFW_STATUS_NUMBERED_CACHE"
 
     if (( found == 0 )); then
         echo "  暂无相关规则"
@@ -1932,18 +1934,19 @@ show_direction_rules() {
 }
 
 show_forward_overview() {
+    local line found=0
     echo "--- 本脚本管理的完整端口转发 ---"
     list_forward_rules
     echo "--- UFW 路由放行规则 ---"
-    if is_ufw_active; then
-        local line found=0
+    ensure_ufw_snapshot || return 1
+    if ufw_snapshot_active; then
         while IFS= read -r line; do
             [[ "$line" =~ ^\[ ]] || continue
             if rule_line_matches_direction fwd "$line"; then
                 printf '%s\n' "$line"
                 found=1
             fi
-        done < <(ufw status numbered 2>/dev/null || true)
+        done <<< "$UFW_STATUS_NUMBERED_CACHE"
         (( found == 1 )) || echo "  暂无 UFW 路由规则"
     else
         warn "UFW 当前未启用，显示已保存的 route 配置"
@@ -2022,11 +2025,12 @@ forward_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_forward_rule_interactive || true; pause ;;
-            2) delete_forward_rule_interactive || true; pause ;;
+            1) add_forward_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
+            2) delete_forward_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
             3)
                 warn "该操作只删除 ufw route 规则，不会清理手工配置的 DNAT/SNAT"
                 delete_direction_rules_interactive "转发" fwd || true
+                invalidate_ufw_snapshot
                 pause
                 ;;
             4) ufw show raw || true; pause ;;
@@ -2050,9 +2054,9 @@ inbound_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_inbound_rule_interactive || true; pause ;;
-            2) delete_direction_rules_interactive "入站" in || true; pause ;;
-            3) ufw status numbered || true; pause ;;
+            1) add_inbound_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
+            2) delete_direction_rules_interactive "入站" in || true; invalidate_ufw_snapshot; pause ;;
+            3) ensure_ufw_snapshot && printf '%s\n' "$UFW_STATUS_NUMBERED_CACHE"; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac
@@ -2073,9 +2077,9 @@ outbound_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_outbound_rule_interactive || true; pause ;;
-            2) delete_direction_rules_interactive "出站" out || true; pause ;;
-            3) ufw status numbered || true; pause ;;
+            1) add_outbound_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
+            2) delete_direction_rules_interactive "出站" out || true; invalidate_ufw_snapshot; pause ;;
+            3) ensure_ufw_snapshot && printf '%s\n' "$UFW_STATUS_NUMBERED_CACHE"; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac
@@ -2089,7 +2093,9 @@ control_menu() {
         echo "========================================"
         echo "UFW 管理 > 状态与控制"
         echo "========================================"
-        ufw status verbose || true
+        if ensure_ufw_snapshot; then
+            printf '%s\n' "$UFW_STATUS_VERBOSE_CACHE"
+        fi
         echo
         echo "1) 查看详细规则"
         echo "2) 安全初始化并启用 UFW"
@@ -2100,18 +2106,21 @@ control_menu() {
         read -r -p "请选择: " choice
         case "$choice" in
             1)
-                ufw status numbered || true
-                echo
-                ufw show added || true
+                if ensure_ufw_snapshot; then
+                    printf '%s\n' "$UFW_STATUS_NUMBERED_CACHE"
+                    echo
+                    printf '%s\n' "$UFW_SHOW_ADDED_CACHE"
+                fi
                 pause
                 ;;
-            2) setup_and_enable_ufw || true; pause ;;
-            3) reload_ufw || true; pause ;;
+            2) setup_and_enable_ufw || true; invalidate_ufw_snapshot; pause ;;
+            3) reload_ufw || true; invalidate_ufw_snapshot; pause ;;
             4)
                 warn "禁用 UFW 会停止防火墙保护，但不会删除规则。"
                 if confirm "确认禁用 UFW？" N; then
                     ufw disable
                 fi
+                invalidate_ufw_snapshot
                 pause
                 ;;
             5)
@@ -2126,6 +2135,7 @@ control_menu() {
                     5) ufw logging full ;;
                     *) warn "无效选项" ;;
                 esac
+                invalidate_ufw_snapshot
                 pause
                 ;;
             0) return 0 ;;
@@ -2161,17 +2171,21 @@ ufw_management_menu() {
     fi
 
     init_state
+    invalidate_ufw_snapshot
     show_docker_warning
 
     if (( UFW_JUST_INSTALLED == 1 )); then
         echo
         info "UFW 刚刚安装完成，需要先确认 SSH、HTTP、HTTPS 等必要入站端口"
         setup_and_enable_ufw || true
+        invalidate_ufw_snapshot
     fi
 
     while true; do
         clear || true
-        if is_ufw_active; then
+        if ! ensure_ufw_snapshot; then
+            status_text="状态获取失败"
+        elif ufw_snapshot_active; then
             status_text="已启用"
         else
             status_text="未启用"

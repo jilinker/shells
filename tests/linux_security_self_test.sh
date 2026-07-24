@@ -274,6 +274,16 @@ UFW_FAKE_FAIL=no
 ensure_ufw_snapshot
 assert_eq 3 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
 
+rendered_rules="$TEST_TMP/ufw-rendered-rules"
+show_direction_rules in "入站" > "$rendered_rules"
+show_direction_rules in "入站" >> "$rendered_rules"
+assert_contains "$(cat "$rendered_rules")" '22/tcp ALLOW IN Anywhere'
+assert_eq 3 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+
+invalidate_ufw_snapshot
+ensure_ufw_snapshot
+assert_eq 6 "$(wc -l < "$UFW_CALL_LOG" | tr -d ' ')"
+
 sshd() {
     [[ ${1:-} == -T ]] || return 1
     printf '%s\n' "$hardened_config"
@@ -330,5 +340,13 @@ assert_contains "$(cat "$security_report")" '通过 0  警告 5  未知 1'
 assert_not_contains "$(declare -f main_menu)" 'module_not_implemented'
 assert_contains "$(declare -f main_menu)" 'run_security_check'
 grep -Fq '只读系统安全检查' "$ROOT_DIR/README.md"
+assert_not_contains "$(declare -f inbound_menu)" 'ufw status numbered'
+assert_not_contains "$(declare -f outbound_menu)" 'ufw status numbered'
+assert_not_contains "$(declare -f control_menu)" 'ufw status verbose'
+assert_contains "$(declare -f inbound_menu)" 'invalidate_ufw_snapshot'
+assert_contains "$(declare -f outbound_menu)" 'invalidate_ufw_snapshot'
+assert_contains "$(declare -f forward_menu)" 'invalidate_ufw_snapshot'
+assert_contains "$(declare -f control_menu)" 'invalidate_ufw_snapshot'
+assert_contains "$(declare -f ufw_management_menu)" 'ensure_ufw_snapshot'
 
 printf 'linux security self test passed\n'
