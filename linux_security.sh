@@ -2160,6 +2160,91 @@ ufw_management_menu() {
     done
 }
 
+# 检查 SSH 服务与配置
+security_check_ssh() {
+    local service config
+    command -v sshd >/dev/null 2>&1 || { record_security_check unknown "SSH 未安装"; return 0; }
+    service=$(ssh_service_name 2>/dev/null) || { record_security_check unknown "未找到 SSH systemd 服务"; return 0; }
+    systemctl is-active --quiet "$service" 2>/dev/null || { record_security_check warning "SSH 服务未运行"; return 0; }
+    config=$(sshd -T 2>/dev/null) || { record_security_check warning "SSH 生效配置无法读取"; return 0; }
+    if ssh_effective_config_hardened "$config"; then
+        record_security_check pass "SSH 服务运行且生效配置已加固"
+    else
+        record_security_check warning "SSH 生效配置未达到加固目标"
+    fi
+}
+
+# 检查 root 公钥
+security_check_root_key() {
+    command -v ssh-keygen >/dev/null 2>&1 || { record_security_check unknown "无法校验 root SSH 公钥"; return 0; }
+    if has_valid_authorized_key; then
+        record_security_check pass "root authorized_keys 包含有效公钥"
+    else
+        record_security_check warning "root authorized_keys 没有有效公钥"
+    fi
+}
+
+# 检查 SSH 监听端口
+security_check_ssh_ports() {
+    local ports port
+    command -v ss >/dev/null 2>&1 || { record_security_check unknown "缺少 ss 无法检查 SSH 监听端口"; return 0; }
+    ports=$(all_current_ssh_ports 2>/dev/null || true)
+    [[ -n "$ports" ]] || { record_security_check unknown "无法确定 SSH 监听端口"; return 0; }
+    while IFS= read -r port; do
+        port_is_listening "$port" || { record_security_check warning "SSH 端口 ${port} 未监听"; return 0; }
+    done <<< "$ports"
+    record_security_check pass "SSH 端口 $(paste -sd, - <<< "$ports") 正在监听"
+}
+
+# 检查 UFW 状态
+security_check_ufw() {
+    command -v ufw >/dev/null 2>&1 || { record_security_check unknown "UFW 未安装"; return 0; }
+    if is_ufw_active; then
+        record_security_check pass "UFW 已启用"
+    else
+        record_security_check warning "UFW 未启用"
+    fi
+}
+
+# 检查 Fail2Ban 状态
+security_check_fail2ban() {
+    command -v fail2ban-client >/dev/null 2>&1 || { record_security_check unknown "Fail2Ban 未安装"; return 0; }
+    systemd_unit_loaded fail2ban.service || { record_security_check unknown "未找到 Fail2Ban systemd 服务"; return 0; }
+    systemctl is-active --quiet fail2ban.service 2>/dev/null || { record_security_check warning "Fail2Ban 服务未运行"; return 0; }
+    if fail2ban-client status sshd >/dev/null 2>&1; then
+        record_security_check pass "Fail2Ban 服务运行且 sshd jail 可用"
+    else
+        record_security_check warning "Fail2Ban sshd jail 不可用"
+    fi
+}
+
+# 检查 Docker 防火墙风险
+security_check_docker() {
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker.service 2>/dev/null; then
+        record_security_check warning "Docker 正在运行 发布端口可能绕过普通 UFW 入站规则"
+    else
+        record_security_check pass "未检测到运行中的 Docker 防火墙绕过风险"
+    fi
+}
+
+# 运行系统安全检查
+run_security_check() {
+    SECURITY_PASS_COUNT=0
+    SECURITY_WARNING_COUNT=0
+    SECURITY_UNKNOWN_COUNT=0
+    echo "========================================"
+    echo "系统安全检查"
+    echo "========================================"
+    security_check_ssh || record_security_check unknown "SSH 检查执行失败"
+    security_check_root_key || record_security_check unknown "root 公钥检查执行失败"
+    security_check_ssh_ports || record_security_check unknown "SSH 端口检查执行失败"
+    security_check_ufw || record_security_check unknown "UFW 检查执行失败"
+    security_check_fail2ban || record_security_check unknown "Fail2Ban 检查执行失败"
+    security_check_docker || record_security_check unknown "Docker 检查执行失败"
+    echo "----------------------------------------"
+    printf '汇总 通过 %d  警告 %d  未知 %d\n' "$SECURITY_PASS_COUNT" "$SECURITY_WARNING_COUNT" "$SECURITY_UNKNOWN_COUNT"
+}
+
 module_not_implemented() {
     local module_name=$1
     warn "${module_name}模块尚未实现，已返回主菜单"

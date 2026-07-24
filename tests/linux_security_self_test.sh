@@ -238,4 +238,42 @@ ssh_effective_config_hardened "$hardened_config"
 assert_fails ssh_effective_config_hardened "${hardened_config/passwordauthentication no/passwordauthentication yes}"
 assert_fails ssh_effective_config_hardened "${hardened_config/maxauthtries 3/maxauthtries 4}"
 
+sshd() {
+    [[ ${1:-} == -T ]] || return 1
+    printf '%s\n' "$hardened_config"
+}
+ssh_service_name() { echo ssh.service; }
+has_valid_authorized_key() { return 0; }
+all_current_ssh_ports() { echo 2222; }
+port_is_listening() { [[ $1 == 2222 ]]; }
+ss() { return 0; }
+is_ufw_active() { return 0; }
+systemd_unit_loaded() { return 0; }
+ufw() { return 0; }
+fail2ban-client() { return 0; }
+systemctl() {
+    if [[ "$*" == *docker* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+mutation_called=0
+install_apt_packages() { mutation_called=1; return 1; }
+write_managed_content() { mutation_called=1; return 1; }
+reload_ssh_runtime() { mutation_called=1; return 1; }
+apply_fail2ban_config() { mutation_called=1; return 1; }
+setup_and_enable_ufw() { mutation_called=1; return 1; }
+
+security_report="$TEST_TMP/security-report"
+run_security_check > "$security_report"
+assert_contains "$(cat "$security_report")" 'SSH 端口 2222 正在监听'
+assert_contains "$(cat "$security_report")" '通过 6  警告 0  未知 0'
+assert_eq 0 "$mutation_called"
+
+security_check_ssh() { return 1; }
+run_security_check > "$security_report"
+assert_contains "$(cat "$security_report")" '[未知] SSH 检查执行失败'
+assert_contains "$(cat "$security_report")" '通过 5  警告 0  未知 1'
+
 printf 'linux security self test passed\n'
