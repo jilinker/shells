@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.1.1"
+VERSION="3.2.0"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -2245,12 +2245,6 @@ run_security_check() {
     printf '汇总 通过 %d  警告 %d  未知 %d\n' "$SECURITY_PASS_COUNT" "$SECURITY_WARNING_COUNT" "$SECURITY_UNKNOWN_COUNT"
 }
 
-module_not_implemented() {
-    local module_name=$1
-    warn "${module_name}模块尚未实现，已返回主菜单"
-    pause
-}
-
 main_menu() {
     local choice
     while true; do
@@ -2261,7 +2255,7 @@ main_menu() {
         echo "1) UFW 防火墙管理"
         echo "2) SSH 安全管理"
         echo "3) Fail2Ban 管理"
-        echo "4) 系统安全检查（待扩展）"
+        echo "4) 系统安全检查"
         echo "0) 退出"
         echo
         echo "说明：启动时只检查 root 权限。"
@@ -2272,7 +2266,7 @@ main_menu() {
             1) ufw_management_menu ;;
             2) ssh_management_menu ;;
             3) fail2ban_management_menu ;;
-            4) module_not_implemented "系统安全检查" ;;
+            4) clear || true; run_security_check; pause ;;
             0) echo "已退出。"; return 0 ;;
             *) warn "无效选项"; pause ;;
         esac

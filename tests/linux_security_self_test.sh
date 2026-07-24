@@ -271,9 +271,28 @@ assert_contains "$(cat "$security_report")" 'SSH 端口 2222 正在监听'
 assert_contains "$(cat "$security_report")" '通过 6  警告 0  未知 0'
 assert_eq 0 "$mutation_called"
 
+original_security_check_ssh=$(declare -f security_check_ssh)
 security_check_ssh() { return 1; }
 run_security_check > "$security_report"
 assert_contains "$(cat "$security_report")" '[未知] SSH 检查执行失败'
 assert_contains "$(cat "$security_report")" '通过 5  警告 0  未知 1'
+eval "$original_security_check_ssh"
+
+sshd() {
+    [[ ${1:-} == -T ]] || return 1
+    printf '%s\n' "${hardened_config/passwordauthentication no/passwordauthentication yes}"
+}
+has_valid_authorized_key() { return 1; }
+all_current_ssh_ports() { return 0; }
+is_ufw_active() { return 1; }
+fail2ban-client() { return 1; }
+docker() { return 0; }
+systemctl() { return 0; }
+run_security_check > "$security_report"
+assert_contains "$(cat "$security_report")" '通过 0  警告 5  未知 1'
+
+assert_not_contains "$(declare -f main_menu)" 'module_not_implemented'
+assert_contains "$(declare -f main_menu)" 'run_security_check'
+grep -Fq '只读系统安全检查' "$ROOT_DIR/README.md"
 
 printf 'linux security self test passed\n'

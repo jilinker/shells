@@ -41,3 +41,9 @@ sudo ./linux_security.sh
 ```bash
 ./tests/linux_security_self_test.sh
 ```
+
+## 只读系统安全检查
+
+主菜单选择 `4` 可一次性检查 SSH 加固与监听端口 root 公钥 UFW Fail2Ban 及 Docker 防火墙风险
+
+检查仅显示通过 警告和未知结果 不安装软件 不修改配置 不重启服务
