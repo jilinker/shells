@@ -214,4 +214,28 @@ delete_ssh_migration_ufw_rule() {
 cleanup_ssh_migration_ufw_rules old new
 assert_fails cleanup_ssh_migration_ufw_rules old fail
 
+RED=
+GREEN=
+YELLOW=
+BLUE=
+NC=
+SECURITY_PASS_COUNT=0
+SECURITY_WARNING_COUNT=0
+SECURITY_UNKNOWN_COUNT=0
+result_output="$TEST_TMP/security-result"
+record_security_check pass "通过项" > "$result_output"
+record_security_check warning "警告项" >> "$result_output"
+record_security_check unknown "未知项" >> "$result_output"
+assert_contains "$(cat "$result_output")" '[通过] 通过项'
+assert_contains "$(cat "$result_output")" '[警告] 警告项'
+assert_contains "$(cat "$result_output")" '[未知] 未知项'
+assert_eq 1 "$SECURITY_PASS_COUNT"
+assert_eq 1 "$SECURITY_WARNING_COUNT"
+assert_eq 1 "$SECURITY_UNKNOWN_COUNT"
+
+hardened_config=$'permitrootlogin prohibit-password\npubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no\nmaxauthtries 3\nlogingracetime 30'
+ssh_effective_config_hardened "$hardened_config"
+assert_fails ssh_effective_config_hardened "${hardened_config/passwordauthentication no/passwordauthentication yes}"
+assert_fails ssh_effective_config_hardened "${hardened_config/maxauthtries 3/maxauthtries 4}"
+
 printf 'linux security self test passed\n'

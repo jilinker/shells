@@ -35,12 +35,36 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+SECURITY_PASS_COUNT=0
+SECURITY_WARNING_COUNT=0
+SECURITY_UNKNOWN_COUNT=0
 
 info()  { printf "%b[信息]%b %s\n" "$BLUE" "$NC" "$*"; }
 ok()    { printf "%b[成功]%b %s\n" "$GREEN" "$NC" "$*"; }
 warn()  { printf "%b[警告]%b %s\n" "$YELLOW" "$NC" "$*"; }
 error() { printf "%b[错误]%b %s\n" "$RED" "$NC" "$*" >&2; }
 die()   { error "$*"; exit 1; }
+
+# 记录安全检查结果
+record_security_check() {
+    local status=$1
+    local message=$2
+    case "$status" in
+        pass)
+            ((SECURITY_PASS_COUNT+=1))
+            printf "%b[通过]%b %s\n" "$GREEN" "$NC" "$message"
+            ;;
+        warning)
+            ((SECURITY_WARNING_COUNT+=1))
+            printf "%b[警告]%b %s\n" "$YELLOW" "$NC" "$message"
+            ;;
+        unknown)
+            ((SECURITY_UNKNOWN_COUNT+=1))
+            printf "%b[未知]%b %s\n" "$BLUE" "$NC" "$message"
+            ;;
+        *) return 1 ;;
+    esac
+}
 
 # 检查流式脚本路径
 is_streamed_source() {
@@ -512,6 +536,20 @@ show_ssh_status() {
         info "检测到 ssh.socket 正在管理监听端口"
         systemctl show ssh.socket -p Listen --value 2>/dev/null || true
     fi
+}
+
+# 检查 SSH 生效加固配置
+ssh_effective_config_hardened() {
+    local config=$1
+    local max_tries grace_time
+    grep -qx 'permitrootlogin prohibit-password' <<< "$config" || return 1
+    grep -qx 'pubkeyauthentication yes' <<< "$config" || return 1
+    grep -qx 'passwordauthentication no' <<< "$config" || return 1
+    grep -qx 'kbdinteractiveauthentication no' <<< "$config" || return 1
+    max_tries=$(awk '$1 == "maxauthtries" {print $2; exit}' <<< "$config")
+    grace_time=$(awk '$1 == "logingracetime" {print $2; exit}' <<< "$config")
+    [[ "$max_tries" =~ ^[0-9]+$ && "$grace_time" =~ ^[0-9]+$ ]] || return 1
+    (( max_tries <= 3 && grace_time <= 30 ))
 }
 
 # 检测 SSH Socket 监听端口
