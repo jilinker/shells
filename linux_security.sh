@@ -1330,7 +1330,9 @@ validate_port() {
 validate_port_spec() {
     local spec=${1:-}
     local item start end count=0
-    [[ "$spec" =~ ^[0-9,:]+$ ]] || return 1
+    local -a items=()
+
+    [[ "$spec" =~ ^([0-9]+|[0-9]+:[0-9]+)(,([0-9]+|[0-9]+:[0-9]+))*$ ]] || return 1
 
     IFS=',' read -r -a items <<< "$spec"
     for item in "${items[@]}"; do
@@ -1349,6 +1351,34 @@ validate_port_spec() {
 
     # UFW 最多支持 15 个端口元素，端口范围按两个元素计算
     (( count <= 15 ))
+}
+
+# 只接受可安全作为单个 ip/ufw 参数传递的 Linux 网卡名。
+validate_interface_name() {
+    local iface=${1:-}
+    [[ "$iface" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$ ]]
+}
+
+managed_marker() {
+    local batch_id=${1:-} rule_id=${2:-}
+    printf 'lsec:%s:%s' "$batch_id" "$rule_id"
+}
+
+validate_managed_marker() {
+    local marker=${1:-}
+    [[ "$marker" =~ ^lsec:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$ ]]
+}
+
+state_marker_count() {
+    local marker=$1
+    [[ -f "$STATE_FILE" ]] || { printf '0\n'; return 0; }
+    awk -F '\t' -v marker="$marker" '$1 == marker {count++} END {print count + 0}' "$STATE_FILE"
+}
+
+state_has_unique_marker() {
+    local marker=$1
+    validate_managed_marker "$marker" || return 1
+    [[ $(state_marker_count "$marker") == 1 ]]
 }
 
 validate_ipv4() {
@@ -1434,7 +1464,7 @@ validate_address_token_or_any() {
 
 validate_interface() {
     local iface=${1:-}
-    [[ -n "$iface" ]] && ip link show dev "$iface" >/dev/null 2>&1
+    validate_interface_name "$iface" && ip link show dev "$iface" >/dev/null 2>&1
 }
 
 default_interface() {

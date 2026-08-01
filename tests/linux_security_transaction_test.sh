@@ -87,4 +87,32 @@ set_transaction_phase "$batch_id" verified
 finish_transaction "$batch_id" committed
 assert_file_contains "$journal_file" $'phase\tcommitted'
 
+for valid_spec in 80 80,443 10000:10100 53,80:90,443; do
+    assert_status 0 validate_port_spec "$valid_spec"
+done
+for invalid_spec in '80,' ',80' '80,,81' '80::90' '80:90,' 0 65536 '90:80' '80 81' '80;id'; do
+    assert_status 1 validate_port_spec "$invalid_spec"
+done
+
+for valid_interface in eth0 ens3.100 wg-test0; do
+    assert_status 0 validate_interface_name "$valid_interface"
+done
+for invalid_interface in '' '-eth0' 'eth0/1' 'eth0;id' 'interface-name-too-long'; do
+    assert_status 1 validate_interface_name "$invalid_interface"
+done
+
+marker="$(managed_marker batch-1 rule_2)"
+assert_eq "$marker" 'lsec:batch-1:rule_2'
+assert_status 0 validate_managed_marker "$marker"
+assert_status 1 validate_managed_marker 'ufw-relay:old-id'
+assert_status 1 validate_managed_marker 'lsec:batch:rule;id'
+
+printf '%s\n' \
+    $'lsec:batch-1:rule-a\ttcp\tany' \
+    $'lsec:batch-1:rule-a\tudp\tany' \
+    $'lsec:batch-1:rule-b\ttcp\tany' > "$STATE_FILE"
+assert_eq "$(state_marker_count 'lsec:batch-1:rule-a')" 2
+assert_status 1 state_has_unique_marker 'lsec:batch-1:rule-a'
+assert_status 0 state_has_unique_marker 'lsec:batch-1:rule-b'
+
 printf 'linux security transaction test passed\n'
