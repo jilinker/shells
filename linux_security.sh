@@ -21,6 +21,7 @@ TRANSACTION_DIR=
 BACKUP_DIR=
 IP_FORWARDING_STATE=
 BEFORE_RULES="${LSEC_BEFORE_RULES:-/etc/ufw/before.rules}"
+UFW_SYSCTL_FILE="${LSEC_UFW_SYSCTL_FILE:-/etc/ufw/sysctl.conf}"
 NAT_BEGIN="# BEGIN UFW-RELAY-MANAGER RULES"
 NAT_END="# END UFW-RELAY-MANAGER RULES"
 UFW_JUST_INSTALLED=0
@@ -62,6 +63,7 @@ readonly STATE_SCHEMA_VERSION=2
 MUTATION_LOCK_HELD=0
 MISSING_DEPENDENCIES=()
 readonly FORWARD_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+readonly UFW_RISK_CONFIRMATION='我确认SSH端口已放行并承担断连风险'
 
 configure_state_paths() {
     STATE_FILE="${STATE_DIR}/forwarding.tsv"
@@ -216,7 +218,9 @@ snapshot_copy_or_empty() {
 }
 
 snapshot_current_state() {
-    local batch_id=$1 operation=$2 snapshot="${BACKUP_DIR}/${batch_id}"
+    local batch_id=$1 operation=$2
+    local snapshot="${BACKUP_DIR}/${batch_id}"
+    local runtime_value=unknown
 
     install -d -m 700 "$TRANSACTION_DIR" "$BACKUP_DIR" "$snapshot" || return 1
     snapshot_copy_or_empty "$BEFORE_RULES" "$snapshot/before.rules" || return 1
@@ -227,6 +231,14 @@ snapshot_current_state() {
     else
         install -m 600 /dev/null "$snapshot/state.version.absent" || return 1
     fi
+    if [[ -f "$UFW_SYSCTL_FILE" ]]; then
+        install -m 600 "$UFW_SYSCTL_FILE" "$snapshot/ufw-sysctl.conf" || return 1
+    else
+        install -m 600 /dev/null "$snapshot/ufw-sysctl.conf.absent" || return 1
+    fi
+    runtime_value=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf 'unknown')
+    printf '%s\n' "$runtime_value" > "$snapshot/runtime-ip-forward" || return 1
+    chmod 600 "$snapshot/runtime-ip-forward" || return 1
     atomic_write "$snapshot/metadata.tsv" snapshot_metadata "$batch_id" "$operation"
 }
 
@@ -1695,59 +1707,220 @@ select_common_inbound_ports() {
     fi
 }
 
-setup_and_enable_ufw() {
+resolve_ssh_ports_for_ufw() {
+    local port_spec phrase port
+    local -a ports=() parsed=()
+    while IFS= read -r port; do
+        validate_port "$port" && ports+=("$port")
+    done < <(detect_ssh_ports no)
+    if (( ${#ports[@]} > 0 )); then
+        printf '%s\n' "${ports[@]}" | sort -n -u
+        return 0
+    fi
+
+    warn "无法从 SSH 会话、sshd 生效配置或监听套接字可靠确定 SSH 端口" >&2
+    read -r -p "请输入必须放行的 SSH 端口，多个用逗号分隔: " port_spec
+    [[ "$port_spec" =~ ^[0-9]+(,[0-9]+)*$ ]] || return "$RESULT_PRECHECK_FAILED"
+    IFS=',' read -r -a parsed <<< "$port_spec"
+    for port in "${parsed[@]}"; do
+        validate_port "$port" || return "$RESULT_PRECHECK_FAILED"
+    done
+    warn "高风险确认短语：${UFW_RISK_CONFIRMATION}" >&2
+    read -r -p "请完整输入确认短语，或直接回车取消: " phrase
+    [[ "$phrase" == "$UFW_RISK_CONFIRMATION" ]] || return "$RESULT_CANCELLED"
+    printf '%s\n' "${parsed[@]}" | sort -n -u
+}
+
+snapshot_ufw_bootstrap() {
+    local batch_id=$1
+    local snapshot="${BACKUP_DIR}/${batch_id}"
+    ufw status verbose > "$snapshot/ufw-status-before.txt" || return 1
+    ufw show added > "$snapshot/ufw-added-before.txt" || return 1
+    chmod 600 "$snapshot/ufw-status-before.txt" "$snapshot/ufw-added-before.txt"
+}
+
+restore_ufw_default_policies() {
+    local batch_id=$1 line incoming outgoing routed
+    line=$(grep '^Default:' "${BACKUP_DIR}/${batch_id}/ufw-status-before.txt" | head -1) || return 1
+    incoming=$(sed -n 's/^Default: \([^ ]*\) (incoming).*/\1/p' <<< "$line")
+    outgoing=$(sed -n 's/^Default: [^,]*, \([^ ]*\) (outgoing).*/\1/p' <<< "$line")
+    routed=$(sed -n 's/^Default: [^,]*, [^,]*, \([^ ]*\) (routed).*/\1/p' <<< "$line")
+    [[ -n "$incoming" && -n "$outgoing" && -n "$routed" ]] || return 1
+    ufw default "$incoming" incoming || return 1
+    ufw default "$outgoing" outgoing || return 1
+    ufw default "$routed" routed
+}
+
+verify_ufw_bootstrap_markers() {
+    local batch_id=$1 port marker added
+    shift
+    added=$(ufw show added 2>/dev/null) || return 1
+    for port in "$@"; do
+        marker=$(managed_marker "$batch_id" "ssh-${port}")
+        grep -Fq -- "$marker" <<< "$added" || return 1
+    done
+}
+
+rollback_ufw_bootstrap() {
+    local batch_id=$1 result=0
+    if is_ufw_active; then
+        ufw disable || result=1
+    fi
+    remove_transaction_ufw_rules "$batch_id" || result=1
+    restore_ufw_default_policies "$batch_id" || result=1
+    is_ufw_active && result=1
+    verify_transaction_ufw_rules_absent "$batch_id" || result=1
+    if (( result == 0 )); then
+        set_transaction_phase "$batch_id" rolled_back
+        return 0
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed '无法验证 UFW 初始化回滚'
+    return 1
+}
+
+enable_ufw_transaction() {
+    local batch_id=$1 port marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
+    shift
+    local -a ssh_ports=("$@")
+    (( ${#ssh_ports[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
+    begin_transaction "$batch_id" enable_ufw "$(IFS=,; echo "${ssh_ports[*]}")" \
+        || return "$RESULT_PRECHECK_FAILED"
+    snapshot_ufw_bootstrap "$batch_id" || {
+        rollback_ufw_bootstrap "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+        return "$RESULT_PRECHECK_FAILED"
+    }
+    if set_transaction_phase "$batch_id" applying_ufw \
+        && ufw default deny incoming \
+        && ufw default allow outgoing \
+        && ufw default deny routed; then
+        for port in "${ssh_ports[@]}"; do
+            marker=$(managed_marker "$batch_id" "ssh-${port}")
+            if record_intended_ufw_marker "$batch_id" "$marker" \
+                && add_inbound_allow_rule "$port" tcp "$marker" \
+                && record_added_ufw_marker "$batch_id" "$marker"; then
+                :
+            else
+                break
+            fi
+        done
+        if verify_ufw_bootstrap_markers "$batch_id" "${ssh_ports[@]}" \
+            && ufw --force enable \
+            && ufw logging low \
+            && is_ufw_active \
+            && verify_ufw_bootstrap_markers "$batch_id" "${ssh_ports[@]}"; then
+            set_transaction_phase "$batch_id" verified \
+                && finish_transaction "$batch_id" committed \
+                && return "$RESULT_OK"
+        fi
+    fi
+    if rollback_ufw_bootstrap "$batch_id"; then
+        return "$failure_result"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
+setup_and_enable_ufw_locked() {
+    local batch_id mode result port ssh_output
+    local -a ssh_ports=()
+
     if is_ufw_active; then
         info "UFW 当前已启用"
-        return 0
+        return "$RESULT_OK"
     fi
-
-    warn "UFW 当前未启用。启用防火墙可能影响远程连接。"
-    if ! confirm "是否配置必要端口并启用 UFW？" Y; then
-        warn "已保留 UFW 未启用状态；规则可编辑，但不会生效"
-        return 0
+    if ssh_output=$(resolve_ssh_ports_for_ufw); then
+        result=$RESULT_OK
+    else
+        return $?
     fi
-
-    # 安全默认策略：入站拒绝、出站允许、路由转发默认拒绝。
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw default deny routed
-
-    select_common_inbound_ports
-
-    echo
-    ufw status numbered || true
-    echo
-    if ! confirm "以上端口确认无误，是否正式启用 UFW？" Y; then
-        warn "已取消启用 UFW，已添加的规则会保留"
-        return 0
+    while IFS= read -r port; do
+        [[ -n "$port" ]] && ssh_ports+=("$port")
+    done <<< "$ssh_output"
+    (( ${#ssh_ports[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
+    batch_id=$(new_batch_id)
+    render_execution_preview enable_ufw "lsec:${batch_id}:ssh-{${ssh_ports[*]}}" \
+        "先放行并验证 SSH TCP 端口 ${ssh_ports[*]}，再设置默认策略并启用 UFW" \
+        "$BEFORE_RULES" "$STATE_FILE" '不修改 IPv4 forwarding'
+    mode=$(select_execution_mode)
+    case "$mode" in
+        preflight)
+            info "SSH 端口识别和 UFW 前置检查通过，未执行任何变更"
+            return "$RESULT_OK"
+            ;;
+        cancel) return "$RESULT_CANCELLED" ;;
+    esac
+    if enable_ufw_transaction "$batch_id" "${ssh_ports[@]}"; then
+        ok "UFW 已启用，SSH 放行规则与本机状态均已验证"
+        return "$RESULT_OK"
     fi
+    return $?
+}
 
-    ufw --force enable
-    ufw logging low
-    ok "UFW 已启用，并设置为开机启动"
+setup_and_enable_ufw() {
+    local result
+    if is_ufw_active; then
+        info "UFW 当前已启用"
+        return "$RESULT_OK"
+    fi
+    if begin_mutation "安全初始化并启用 UFW"; then :; else
+        result=$?
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if require_mutation_allowed; then :; else
+        result=$?
+        end_mutation
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if run_dependency_preflight; then :; else
+        result=$?
+        end_mutation
+        warn "$(result_message "$result")"
+        return "$result"
+    fi
+    if setup_and_enable_ufw_locked; then result=$RESULT_OK; else result=$?; fi
+    end_mutation
+    case "$result" in
+        0) ;;
+        10) warn "$(result_message "$result")" ;;
+        *) error "$(result_message "$result")" ;;
+    esac
+    return "$result"
 }
 
 ensure_ipv4_forwarding() {
-    local file="/etc/ufw/sysctl.conf"
+    local file="$UFW_SYSCTL_FILE"
     local tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp) || return 1
 
-    if grep -Eq '^[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=' "$file"; then
-        awk '
-            /^[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=/ {
+    if [[ -f "$file" ]] && grep -Eq '^[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=' "$file"; then
+        if ! awk '
+            $0 ~ "^[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=" {
                 if (!done) print "net/ipv4/ip_forward=1"
                 done=1
                 next
             }
             { print }
-        ' "$file" > "$tmp"
+        ' "$file" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
     else
-        cat "$file" > "$tmp"
-        printf '\n# Enabled by UFW relay manager\nnet/ipv4/ip_forward=1\n' >> "$tmp"
+        if [[ -f "$file" ]] && ! cat "$file" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        if ! printf '\n# Enabled by UFW relay manager\nnet/ipv4/ip_forward=1\n' >> "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
     fi
 
-    install -m 644 "$tmp" "$file"
-    rm -f "$tmp"
+    if ! install -d -m 755 "$(dirname "$file")" || ! install -m 644 "$tmp" "$file"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    rm -f -- "$tmp"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
 }
 
@@ -1924,12 +2097,113 @@ record_intended_ufw_marker() {
 }
 
 apply_ipv4_forwarding_for_transaction() {
-    local batch_id=$1
-    if [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]]; then
+    local batch_id=$1 runtime persistent owned_runtime=no owned_persistent=no
+    runtime=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || return 1
+    persistent=$(persistent_ipv4_forwarding_value)
+    if [[ "$runtime" == 1 && "$persistent" == 1 ]]; then
         return 0
     fi
+    [[ "$runtime" == 1 ]] || owned_runtime=yes
+    [[ "$persistent" == 1 ]] || owned_persistent=yes
+    atomic_write "$IP_FORWARDING_STATE" write_ipv4_ownership_record \
+        "$batch_id" "$runtime" "$persistent" "$owned_runtime" "$owned_persistent" || return 1
     ensure_ipv4_forwarding || return 1
-    printf 'owner_batch\t%s\nowned\tyes\n' "$batch_id" > "$IP_FORWARDING_STATE"
+    [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]] \
+        && [[ $(persistent_ipv4_forwarding_value) == 1 ]]
+}
+
+persistent_ipv4_forwarding_value() {
+    [[ -f "$UFW_SYSCTL_FILE" ]] || { printf 'absent\n'; return 0; }
+    awk -F '=' '
+        $0 ~ "^[[:space:]]*net[./]ipv4[./]ip_forward[[:space:]]*=" {
+            value=$2
+            gsub(/[[:space:]]/, "", value)
+        }
+        END {print (value == "" ? "unset" : value)}
+    ' "$UFW_SYSCTL_FILE"
+}
+
+write_ipv4_ownership_record() {
+    local batch_id=$1 original_runtime=$2 original_persistent=$3
+    local owned_runtime=$4 owned_persistent=$5
+    printf 'owner_batch\t%s\n' "$batch_id"
+    printf 'owner_snapshot\t%s\n' "${BACKUP_DIR}/${batch_id}"
+    printf 'original_runtime\t%s\n' "$original_runtime"
+    printf 'original_persistent\t%s\n' "$original_persistent"
+    printf 'owned_runtime\t%s\n' "$owned_runtime"
+    printf 'owned_persistent\t%s\n' "$owned_persistent"
+}
+
+detect_other_forwarding_use() {
+    local marker line skip
+    local -a ignored_markers=("$@")
+
+    if [[ -s "$STATE_FILE" ]]; then
+        while IFS=$'\t' read -r marker line; do
+            [[ -n "$marker" ]] || continue
+            skip=0
+            if (( ${#ignored_markers[@]} > 0 )); then
+                for line in "${ignored_markers[@]}"; do
+                    [[ "$marker" == "$line" ]] && { skip=1; break; }
+                done
+            fi
+            (( skip == 1 )) || return 0
+        done < "$STATE_FILE"
+    fi
+
+    if [[ -f "$BEFORE_RULES" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == *'-j DNAT'* || "$line" == *'-j SNAT'* || "$line" == *'-j MASQUERADE'* ]] || continue
+            skip=0
+            if (( ${#ignored_markers[@]} > 0 )); then
+                for marker in "${ignored_markers[@]}"; do
+                    [[ "$line" == *"--comment ${marker}:"* ]] && { skip=1; break; }
+                done
+            fi
+            (( skip == 1 )) || return 0
+        done < "$BEFORE_RULES"
+    fi
+    return 1
+}
+
+write_empty_file() {
+    :
+}
+
+restore_owned_ipv4_forwarding() {
+    local owner_batch owned_runtime owned_persistent snapshot runtime_value
+    [[ -s "$IP_FORWARDING_STATE" ]] || return 1
+    owner_batch=$(awk -F '\t' '$1 == "owner_batch" {print $2; exit}' "$IP_FORWARDING_STATE")
+    owned_runtime=$(awk -F '\t' '$1 == "owned_runtime" {print $2; exit}' "$IP_FORWARDING_STATE")
+    owned_persistent=$(awk -F '\t' '$1 == "owned_persistent" {print $2; exit}' "$IP_FORWARDING_STATE")
+    [[ "$owner_batch" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    snapshot="${BACKUP_DIR}/${owner_batch}"
+    [[ -d "$snapshot" ]] || return 1
+
+    if [[ "$owned_persistent" == yes ]]; then
+        if [[ -f "$snapshot/ufw-sysctl.conf.absent" ]]; then
+            rm -f -- "$UFW_SYSCTL_FILE" || return 1
+        else
+            install -m 644 "$snapshot/ufw-sysctl.conf" "$UFW_SYSCTL_FILE" || return 1
+        fi
+    fi
+    if [[ "$owned_runtime" == yes ]]; then
+        runtime_value=$(cat "$snapshot/runtime-ip-forward") || return 1
+        [[ "$runtime_value" == 0 || "$runtime_value" == 1 ]] || return 1
+        sysctl -w "net.ipv4.ip_forward=${runtime_value}" >/dev/null || return 1
+    fi
+
+    if [[ "$owned_persistent" == yes ]]; then
+        if [[ -f "$snapshot/ufw-sysctl.conf.absent" ]]; then
+            [[ ! -e "$UFW_SYSCTL_FILE" ]] || return 1
+        else
+            cmp -s "$snapshot/ufw-sysctl.conf" "$UFW_SYSCTL_FILE" || return 1
+        fi
+    fi
+    if [[ "$owned_runtime" == yes ]]; then
+        [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == "$runtime_value" ]] || return 1
+    fi
+    atomic_write "$IP_FORWARDING_STATE" write_empty_file
 }
 
 verify_forwarding_batch() {
@@ -1946,7 +2220,9 @@ verify_forwarding_batch() {
 }
 
 restore_transaction_snapshot() {
-    local batch_id=$1 snapshot="${BACKUP_DIR}/${batch_id}"
+    local batch_id=$1
+    local snapshot="${BACKUP_DIR}/${batch_id}"
+    local runtime_value
     install -m 640 "$snapshot/before.rules" "$BEFORE_RULES" || return 1
     install -m 600 "$snapshot/forwarding.tsv" "$STATE_FILE" || return 1
     install -m 600 "$snapshot/ip-forwarding.tsv" "$IP_FORWARDING_STATE" || return 1
@@ -1955,18 +2231,38 @@ restore_transaction_snapshot() {
     else
         install -m 600 "$snapshot/state.version" "$STATE_VERSION_FILE" || return 1
     fi
+    if [[ -f "$snapshot/ufw-sysctl.conf.absent" ]]; then
+        rm -f -- "$UFW_SYSCTL_FILE" || return 1
+    else
+        install -m 644 "$snapshot/ufw-sysctl.conf" "$UFW_SYSCTL_FILE" || return 1
+    fi
+    runtime_value=$(cat "$snapshot/runtime-ip-forward") || return 1
+    if [[ "$runtime_value" == 0 || "$runtime_value" == 1 ]]; then
+        sysctl -w "net.ipv4.ip_forward=${runtime_value}" >/dev/null || return 1
+    fi
     reload_ufw
 }
 
 verify_snapshot_restored() {
-    local batch_id=$1 snapshot="${BACKUP_DIR}/${batch_id}"
+    local batch_id=$1
+    local snapshot="${BACKUP_DIR}/${batch_id}"
+    local runtime_value
     cmp -s "$snapshot/before.rules" "$BEFORE_RULES" || return 1
     cmp -s "$snapshot/forwarding.tsv" "$STATE_FILE" || return 1
     cmp -s "$snapshot/ip-forwarding.tsv" "$IP_FORWARDING_STATE" || return 1
     if [[ -f "$snapshot/state.version.absent" ]]; then
         [[ ! -e "$STATE_VERSION_FILE" ]]
     else
-        cmp -s "$snapshot/state.version" "$STATE_VERSION_FILE"
+        cmp -s "$snapshot/state.version" "$STATE_VERSION_FILE" || return 1
+    fi
+    if [[ -f "$snapshot/ufw-sysctl.conf.absent" ]]; then
+        [[ ! -e "$UFW_SYSCTL_FILE" ]] || return 1
+    else
+        cmp -s "$snapshot/ufw-sysctl.conf" "$UFW_SYSCTL_FILE" || return 1
+    fi
+    runtime_value=$(cat "$snapshot/runtime-ip-forward") || return 1
+    if [[ "$runtime_value" == 0 || "$runtime_value" == 1 ]]; then
+        [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == "$runtime_value" ]]
     fi
 }
 
@@ -2175,6 +2471,11 @@ rollback_deleted_forwarding() {
 delete_forwarding_transaction() {
     local batch_id=$1 staged=$2
     shift 2
+    local restore_ipv4=no
+    if [[ ${1:-} == --restore-ipv4=* ]]; then
+        restore_ipv4=${1#*=}
+        shift
+    fi
     local -a markers=("$@")
     local marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK deleted=0
 
@@ -2202,6 +2503,7 @@ delete_forwarding_transaction() {
         if (( deleted == ${#markers[@]} )) \
             && set_transaction_phase "$batch_id" committing_state \
             && commit_forward_state_removal "${markers[@]}" \
+            && { [[ "$restore_ipv4" == no ]] || restore_owned_ipv4_forwarding; } \
             && reload_ufw \
             && set_transaction_phase "$batch_id" verifying; then
             if verify_forwarding_markers_absent "${markers[@]}"; then
@@ -2746,7 +3048,7 @@ add_forward_rule_interactive() {
 }
 
 delete_forward_rule_interactive_locked() {
-    local selection marker staged batch_id mode result
+    local selection marker staged batch_id mode result restore_ipv4=no total_rules
     local -a indexes=()
     local -a markers=()
 
@@ -2772,6 +3074,16 @@ delete_forward_rule_interactive_locked() {
     done
 
     (( ${#markers[@]} > 0 )) || return "$RESULT_CANCELLED"
+    total_rules=$(awk 'NF {count++} END {print count + 0}' "$STATE_FILE")
+    if (( ${#markers[@]} == total_rules )) && grep -Eq '^owned_(runtime|persistent)[[:space:]]+yes$' "$IP_FORWARDING_STATE" 2>/dev/null; then
+        if detect_other_forwarding_use "${markers[@]}"; then
+            warn "检测到其他转发用途，不允许自动恢复 IPv4 forwarding"
+        elif confirm "这是最后一批受管转发，是否恢复本脚本启用前的 IPv4 forwarding？" N; then
+            restore_ipv4=yes
+        else
+            info "将保留当前 IPv4 forwarding 设置"
+        fi
+    fi
     batch_id=$(new_batch_id)
     staged=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
     if ! stage_forward_nat_removal "$staged" "${markers[@]}" || ! validate_staged_nat "$staged"; then
@@ -2780,7 +3092,7 @@ delete_forward_rule_interactive_locked() {
         return "$RESULT_PRECHECK_FAILED"
     fi
     render_execution_preview delete "$(IFS=,; echo "${markers[*]}")" \
-        "删除 ${#markers[@]} 条精确受管规则" "$BEFORE_RULES" "$STATE_FILE" '删除最后规则时另行提示'
+        "删除 ${#markers[@]} 条精确受管规则" "$BEFORE_RULES" "$STATE_FILE" "restore=${restore_ipv4}"
     mode=$(select_execution_mode)
     case "$mode" in
         preflight)
@@ -2794,7 +3106,7 @@ delete_forward_rule_interactive_locked() {
             ;;
     esac
 
-    if delete_forwarding_transaction "$batch_id" "$staged" "${markers[@]}"; then
+    if delete_forwarding_transaction "$batch_id" "$staged" "--restore-ipv4=${restore_ipv4}" "${markers[@]}"; then
         result=$RESULT_OK
     else
         result=$?
@@ -3206,7 +3518,7 @@ control_menu() {
                 fi
                 pause
                 ;;
-            2) setup_and_enable_ufw || true; invalidate_ufw_snapshot; pause ;;
+            2) if setup_and_enable_ufw; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             3) reload_ufw || true; invalidate_ufw_snapshot; pause ;;
             4)
                 warn "禁用 UFW 会停止防火墙保护，但不会删除规则。"
@@ -3270,7 +3582,7 @@ ufw_management_menu() {
     if (( UFW_JUST_INSTALLED == 1 )); then
         echo
         info "UFW 刚刚安装完成，需要先确认 SSH、HTTP、HTTPS 等必要入站端口"
-        setup_and_enable_ufw || true
+        if setup_and_enable_ufw; then :; else :; fi
         invalidate_ufw_snapshot
     fi
 

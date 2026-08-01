@@ -279,7 +279,7 @@ assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$failure_before
 assert_eq "$(wc -c < "$STATE_FILE" | tr -d ' ')" 0
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified rollback must not create protected lock'
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 UFW_FAIL_ADD_AT=0
 
 STATE_DIR="$TEST_TMP/create-validation-state"
@@ -299,7 +299,7 @@ assert_status "$RESULT_PRECHECK_FAILED" create_forwarding_transaction \
 assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$validation_before_hash"
 [[ ! -e "$TRANSACTION_DIR/batch-validation.txn" ]] || fail 'invalid staging created a journal'
 IPTABLES_RESTORE_FAIL=0
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 STATE_DIR="$TEST_TMP/create-record-state"
 configure_state_paths
@@ -319,7 +319,7 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-record-fail "$record_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp >/dev/null 2>&1
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
 eval "$original_record_added"
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 prepare_create_failure_case() {
     local batch=$1
@@ -346,7 +346,7 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-nat-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$FAILURE_BEFORE_HASH"
 eval "$original_apply_staged"
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 original_commit_state="$(declare -f commit_forward_state)"
 prepare_create_failure_case batch-state-fail
@@ -356,7 +356,7 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-state-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
 eval "$original_commit_state"
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 original_verify_batch="$(declare -f verify_forwarding_batch)"
 prepare_create_failure_case batch-verify-fail
@@ -367,7 +367,7 @@ assert_status "$RESULT_VERIFY_FAILED_ROLLED_BACK" create_forwarding_transaction 
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
 [[ ! -e "$STATE_VERSION_FILE" ]] || fail 'rollback left a state.version that did not exist before'
 eval "$original_verify_batch"
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 original_restore_snapshot="$(declare -f restore_transaction_snapshot)"
 prepare_create_failure_case batch-rollback-fail
@@ -380,7 +380,7 @@ assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbatch-rollback-fail'
 assert_status "$RESULT_PROTECTED_LOCKOUT" require_mutation_allowed >/dev/null 2>&1
 eval "$original_apply_staged"
 eval "$original_restore_snapshot"
-unset -f apply_ipv4_forwarding_for_transaction
+eval "$original_ipv4_apply"
 
 forward_create_definition="$(declare -f add_forward_rule_interactive_locked; declare -f add_forward_rule_interactive)"
 assert_not_contains "$forward_create_definition" 'ensure_ipv4_forwarding'
@@ -527,5 +527,138 @@ assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
 assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:tcp'
 assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:udp'
 UFW_FAIL_ADD_AT=0
+
+assert_contains "$(declare -f ensure_ipv4_forwarding)" 'UFW_SYSCTL_FILE'
+
+STATE_DIR="$TEST_TMP/ipv4-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+BEFORE_RULES="$TEST_TMP/ipv4-before.rules"
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+: > "$STATE_FILE"
+UFW_SYSCTL_FILE="$TEST_TMP/ufw-sysctl.conf"
+printf 'net/ipv4/ip_forward=0\n' > "$UFW_SYSCTL_FILE"
+SYSCTL_RUNTIME=0
+sysctl() {
+    case "$1" in
+        -n) printf '%s\n' "$SYSCTL_RUNTIME" ;;
+        -w) SYSCTL_RUNTIME=${2#*=}; printf 'net.ipv4.ip_forward = %s\n' "$SYSCTL_RUNTIME" ;;
+        *) return 1 ;;
+    esac
+}
+begin_transaction ipv4-batch create tcp
+apply_ipv4_forwarding_for_transaction ipv4-batch
+assert_eq "$SYSCTL_RUNTIME" 1
+assert_file_contains "$UFW_SYSCTL_FILE" 'net/ipv4/ip_forward=1'
+assert_file_contains "$IP_FORWARDING_STATE" $'original_runtime\t0'
+assert_file_contains "$IP_FORWARDING_STATE" $'owned_runtime\tyes'
+assert_file_contains "$IP_FORWARDING_STATE" $'owned_persistent\tyes'
+restore_transaction_snapshot ipv4-batch
+assert_eq "$SYSCTL_RUNTIME" 0
+assert_file_contains "$UFW_SYSCTL_FILE" 'net/ipv4/ip_forward=0'
+
+apply_ipv4_forwarding_for_transaction ipv4-batch
+assert_status 1 detect_other_forwarding_use
+printf '%s\n' $'lsec:other:tcp\ttcp\tany\teth0\t80\teth1\t10.0.0.3\t80\tyes\tother' > "$STATE_FILE"
+assert_status 0 detect_other_forwarding_use
+: > "$STATE_FILE"
+printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' '-A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 10.0.0.3:80' 'COMMIT' > "$BEFORE_RULES"
+assert_status 0 detect_other_forwarding_use
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+restore_owned_ipv4_forwarding
+assert_eq "$SYSCTL_RUNTIME" 0
+assert_file_contains "$UFW_SYSCTL_FILE" 'net/ipv4/ip_forward=0'
+assert_eq "$(wc -c < "$IP_FORWARDING_STATE" | tr -d ' ')" 0
+
+SYSCTL_RUNTIME=1
+printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"
+: > "$IP_FORWARDING_STATE"
+apply_ipv4_forwarding_for_transaction no-ownership
+assert_eq "$(wc -c < "$IP_FORWARDING_STATE" | tr -d ' ')" 0
+assert_contains "$(declare -f delete_forward_rule_interactive_locked)" 'detect_other_forwarding_use'
+assert_contains "$(declare -f delete_forwarding_transaction)" 'restore_owned_ipv4_forwarding'
+unset -f sysctl
+
+original_detect_ssh_ports="$(declare -f detect_ssh_ports)"
+detect_ssh_ports() { return 0; }
+assert_status "$RESULT_CANCELLED" resolve_ssh_ports_for_ufw <<< $'2222\n错误短语\n' >/dev/null 2>&1
+assert_eq "$(resolve_ssh_ports_for_ufw <<< $'2222\n我确认SSH端口已放行并承担断连风险\n' 2>/dev/null)" 2222
+detect_ssh_ports() { printf '2200\n2222\n'; }
+assert_eq "$(resolve_ssh_ports_for_ufw 2>/dev/null)" $'2200\n2222'
+eval "$original_detect_ssh_ports"
+
+BOOT_UFW_ACTIVE=no
+BOOT_UFW_FAIL=
+BOOT_UFW_MARKERS=()
+BOOT_UFW_LOG="$TEST_TMP/ufw-bootstrap.log"
+ufw() {
+    local previous= argument number index
+    printf '%s\n' "$*" >> "$BOOT_UFW_LOG"
+    [[ "$BOOT_UFW_FAIL" != "$1 ${2:-}" && "$BOOT_UFW_FAIL" != "$1" ]] || return 1
+    case "$*" in
+        status) printf 'Status: %s\n' "$([[ "$BOOT_UFW_ACTIVE" == yes ]] && echo active || echo inactive)" ;;
+        'status verbose')
+            printf 'Status: %s\n' "$([[ "$BOOT_UFW_ACTIVE" == yes ]] && echo active || echo inactive)"
+            printf 'Default: deny (incoming), allow (outgoing), deny (routed)\n'
+            ;;
+        'show added')
+            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then printf '%s\n' "${BOOT_UFW_MARKERS[@]}"; fi
+            ;;
+        'status numbered')
+            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then
+                for (( index=0; index<${#BOOT_UFW_MARKERS[@]}; index++ )); do
+                    printf '[ %d] ALLOW IN %s\n' "$((index + 1))" "${BOOT_UFW_MARKERS[$index]}"
+                done
+            fi
+            ;;
+        '--force enable') BOOT_UFW_ACTIVE=yes ;;
+        disable) BOOT_UFW_ACTIVE=no ;;
+        '--force delete '*)
+            number=$3
+            index=$((number - 1))
+            if (( ${#BOOT_UFW_MARKERS[@]} == 1 )); then BOOT_UFW_MARKERS=(); else
+                unset 'BOOT_UFW_MARKERS[index]'
+                BOOT_UFW_MARKERS=("${BOOT_UFW_MARKERS[@]}")
+            fi
+            ;;
+        *)
+            for argument in "$@"; do
+                if [[ "$previous" == comment ]]; then BOOT_UFW_MARKERS+=("$argument"); break; fi
+                previous=$argument
+            done
+            ;;
+    esac
+}
+
+STATE_DIR="$TEST_TMP/ufw-bootstrap-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+: > "$BOOT_UFW_LOG"
+enable_ufw_transaction ufw-success 2200 2222
+assert_eq "$BOOT_UFW_ACTIVE" yes
+allow_line=$(grep -n 'allow in proto tcp.*port 2200' "$BOOT_UFW_LOG" | head -1 | cut -d: -f1)
+enable_line=$(grep -n '^--force enable$' "$BOOT_UFW_LOG" | head -1 | cut -d: -f1)
+(( allow_line < enable_line )) || fail 'UFW enabled before SSH allow rule'
+
+STATE_DIR="$TEST_TMP/ufw-bootstrap-failure-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+BOOT_UFW_ACTIVE=no
+BOOT_UFW_MARKERS=()
+BOOT_UFW_FAIL='--force enable'
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" enable_ufw_transaction ufw-failure 2222 >/dev/null 2>&1
+assert_eq "$BOOT_UFW_ACTIVE" no
+assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified UFW rollback created protected lock'
+BOOT_UFW_FAIL=
+
+ufw_setup_definition="$(declare -f setup_and_enable_ufw_locked; declare -f setup_and_enable_ufw)"
+assert_contains "$ufw_setup_definition" 'resolve_ssh_ports_for_ufw'
+assert_contains "$ufw_setup_definition" 'enable_ufw_transaction'
+assert_not_contains "$ufw_setup_definition" 'select_common_inbound_ports'
+assert_not_contains "$(declare -f control_menu)" 'setup_and_enable_ufw || true'
+detect_ssh_ports() { return 0; }
+assert_status "$RESULT_CANCELLED" setup_and_enable_ufw_locked <<< $'2222\n错误短语\n' >/dev/null 2>&1
+eval "$original_detect_ssh_ports"
 
 printf 'linux security transaction test passed\n'
