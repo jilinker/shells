@@ -376,6 +376,14 @@ iptables-save() {
 assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 iptables-save() {
+    normalize_iptables_rule_for_delete < "$LIVE_NAT_FILE" \
+        | sed -E \
+            -e 's#^-A PREROUTING -i ([^ ]+) -p (tcp|udp) --dport ([^ ]+) -m comment --comment ([^ ]+) -j DNAT --to-destination ([^ ]+)$#-A PREROUTING -p \2 -m \2 -i \1 -m comment --comment "\4" --dport \3 -j DNAT --to-destination \5#' \
+            -e 's#^-A POSTROUTING -o ([^ ]+) -p (tcp|udp) -d ([0-9.]+) --dport ([^ ]+) -m comment --comment ([^ ]+) -j MASQUERADE$#-A POSTROUTING -d \3/32 -o \1 -p \2 -m \2 --dport \4 -m comment --comment "\5" -j MASQUERADE#'
+}
+assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+iptables-save() {
     awk '/^-A PREROUTING / {rules[++count]=$0} END {for (i=count; i>=1; i--) print rules[i]}' "$LIVE_NAT_FILE"
     awk '/^-A POSTROUTING / {print}' "$LIVE_NAT_FILE"
 }
