@@ -60,6 +60,8 @@ readonly RESULT_REPAIR_REQUIRED=70
 readonly MUTATION_LOCK_FD=9
 readonly STATE_SCHEMA_VERSION=2
 MUTATION_LOCK_HELD=0
+MISSING_DEPENDENCIES=()
+readonly FORWARD_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
 
 configure_state_paths() {
     STATE_FILE="${STATE_DIR}/forwarding.tsv"
@@ -264,6 +266,102 @@ finish_transaction() {
         return 1
     fi
     set_transaction_phase "$batch_id" "$terminal_phase"
+}
+
+dependency_available() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+collect_missing_dependencies() {
+    local dependency
+    MISSING_DEPENDENCIES=()
+    for dependency in $FORWARD_DEPENDENCIES; do
+        dependency_available "$dependency" || MISSING_DEPENDENCIES+=("$dependency")
+    done
+    (( ${#MISSING_DEPENDENCIES[@]} == 0 ))
+}
+
+print_missing_dependencies() {
+    warn "缺少转发事务所需组件：${MISSING_DEPENDENCIES[*]}"
+}
+
+missing_dependency_packages() {
+    local dependency package packages=' '
+    for dependency in "${MISSING_DEPENDENCIES[@]}"; do
+        case "$dependency" in
+            flock) package=util-linux ;;
+            ufw) package=ufw ;;
+            iptables|iptables-restore) package=iptables ;;
+            sysctl) package=procps ;;
+            *) return 1 ;;
+        esac
+        if [[ "$packages" != *" $package "* ]]; then
+            packages+="$package "
+            printf '%s\n' "$package"
+        fi
+    done
+}
+
+install_missing_dependencies() {
+    local -a packages=()
+    check_debian_family || {
+        error "请手动安装以下命令后重试：${MISSING_DEPENDENCIES[*]}"
+        return 1
+    }
+    mapfile -t packages < <(missing_dependency_packages) || return 1
+    (( ${#packages[@]} > 0 )) || return 0
+    apt-get update || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+}
+
+run_dependency_preflight() {
+    while true; do
+        if collect_missing_dependencies; then
+            return "$RESULT_OK"
+        fi
+        print_missing_dependencies
+        if ! confirm "是否自动安装缺失组件？" N; then
+            return "$RESULT_CANCELLED"
+        fi
+        if ! install_missing_dependencies; then
+            error "组件安装失败，已停止操作"
+            return "$RESULT_PRECHECK_FAILED"
+        fi
+        info "组件处理完成，正在从头重新执行前置检查"
+    done
+}
+
+render_execution_preview() {
+    local operation=$1 marker=$2 description=$3 nat_file=$4 state_file=$5 ipv4_change=$6
+    cat <<EOF
+========================================
+执行预览
+========================================
+操作：${operation}
+规则：${description}
+受管标记：${marker}
+NAT 配置：${nat_file}
+状态文件：${state_file}
+IPv4 转发：${ipv4_change}
+回滚范围：NAT、UFW 路由规则、状态文件、由本事务拥有的 IPv4 转发变更
+验证边界：仅验证本机配置，不证明应用协议端到端可达
+EOF
+}
+
+select_execution_mode() {
+    local choice
+    {
+        echo "1) 执行变更"
+        echo "2) 仅运行前置检查"
+        echo "3) 取消"
+    } >&2
+    read -r -p "请选择 [默认 3]: " choice
+    case ${choice:-3} in
+        1) printf 'execute\n' ;;
+        2) printf 'preflight\n' ;;
+        3) printf 'cancel\n' ;;
+        *) printf 'cancel\n' ;;
+    esac
 }
 
 # 记录安全检查结果

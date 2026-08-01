@@ -115,4 +115,46 @@ assert_eq "$(state_marker_count 'lsec:batch-1:rule-a')" 2
 assert_status 1 state_has_unique_marker 'lsec:batch-1:rule-a'
 assert_status 0 state_has_unique_marker 'lsec:batch-1:rule-b'
 
+original_dependency_available="$(declare -f dependency_available 2>/dev/null || true)"
+AVAILABLE_DEPENDENCIES='flock ufw sysctl'
+dependency_available() {
+    [[ " $AVAILABLE_DEPENDENCIES " == *" $1 "* ]]
+}
+assert_status 1 collect_missing_dependencies
+assert_eq "${MISSING_DEPENDENCIES[*]}" 'iptables iptables-restore'
+AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+assert_status 0 collect_missing_dependencies
+
+original_confirm="$(declare -f confirm)"
+confirm() { return 1; }
+AVAILABLE_DEPENDENCIES='flock'
+assert_status "$RESULT_CANCELLED" run_dependency_preflight >/dev/null 2>&1
+
+install_attempts=0
+confirm() { return 0; }
+install_missing_dependencies() {
+    ((install_attempts += 1))
+    AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+}
+run_dependency_preflight >/dev/null
+assert_eq "$install_attempts" 1
+eval "$original_confirm"
+if [[ -n "$original_dependency_available" ]]; then
+    eval "$original_dependency_available"
+else
+    unset -f dependency_available
+fi
+unset -f install_missing_dependencies
+
+preview_output="$(render_execution_preview \
+    create 'lsec:batch-2:rule-a' 'TCP+UDP 52350 -> 10.0.0.2:52350' \
+    "$BEFORE_RULES" "$STATE_FILE" 'enable-if-needed')"
+assert_contains "$preview_output" '执行预览'
+assert_contains "$preview_output" 'lsec:batch-2:rule-a'
+assert_contains "$preview_output" '回滚范围'
+assert_contains "$preview_output" '仅验证本机配置，不证明应用协议端到端可达'
+assert_eq "$(printf '1\n' | select_execution_mode 2>/dev/null)" execute
+assert_eq "$(printf '2\n' | select_execution_mode 2>/dev/null)" preflight
+assert_eq "$(printf '3\n' | select_execution_mode 2>/dev/null)" cancel
+
 printf 'linux security transaction test passed\n'
