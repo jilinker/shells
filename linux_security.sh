@@ -12,9 +12,14 @@ INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
 PROGRAM_MARKER='PROGRAM_NAME="Linux 服务器安全防护管理器"'
-STATE_DIR="/etc/ufw/relay-manager"
-STATE_FILE="${STATE_DIR}/forwarding.tsv"
-BEFORE_RULES="/etc/ufw/before.rules"
+STATE_DIR="${LSEC_STATE_DIR:-/etc/ufw/relay-manager}"
+STATE_FILE=
+STATE_VERSION_FILE=
+OPERATION_LOCK=
+PROTECTED_LOCK=
+TRANSACTION_DIR=
+BACKUP_DIR=
+BEFORE_RULES="${LSEC_BEFORE_RULES:-/etc/ufw/before.rules}"
 NAT_BEGIN="# BEGIN UFW-RELAY-MANAGER RULES"
 NAT_END="# END UFW-RELAY-MANAGER RULES"
 UFW_JUST_INSTALLED=0
@@ -51,6 +56,19 @@ readonly RESULT_ROLLBACK_FAILED=40
 readonly RESULT_VERIFY_FAILED_ROLLED_BACK=50
 readonly RESULT_PROTECTED_LOCKOUT=60
 readonly RESULT_REPAIR_REQUIRED=70
+readonly MUTATION_LOCK_FD=9
+MUTATION_LOCK_HELD=0
+
+configure_state_paths() {
+    STATE_FILE="${STATE_DIR}/forwarding.tsv"
+    STATE_VERSION_FILE="${STATE_DIR}/state.version"
+    OPERATION_LOCK="${STATE_DIR}/operation.lock"
+    PROTECTED_LOCK="${STATE_DIR}/protected.lock"
+    TRANSACTION_DIR="${STATE_DIR}/transactions"
+    BACKUP_DIR="${STATE_DIR}/backups"
+}
+
+configure_state_paths
 
 info()  { printf "%b[信息]%b %s\n" "$BLUE" "$NC" "$*"; }
 ok()    { printf "%b[成功]%b %s\n" "$GREEN" "$NC" "$*"; }
@@ -71,6 +89,71 @@ result_message() {
         70) printf '%s' '发现旧状态或漂移，必须先修复' ;;
         *)  printf '%s' '未知结果' ;;
     esac
+}
+
+# 获取所有系统变更共用的非阻塞排他锁。
+begin_mutation() {
+    local operation=${1:-未命名操作}
+
+    if (( MUTATION_LOCK_HELD == 1 )); then
+        error "当前进程已经持有全局变更锁"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if ! install -d -m 700 "$STATE_DIR"; then
+        error "无法创建状态目录：${STATE_DIR}"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if ! eval "exec ${MUTATION_LOCK_FD}>\"${OPERATION_LOCK}\""; then
+        error "无法打开全局变更锁：${OPERATION_LOCK}"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if ! flock -n "$MUTATION_LOCK_FD"; then
+        eval "exec ${MUTATION_LOCK_FD}>&-"
+        warn "已有其他 lsec 变更正在执行"
+        [[ -s "$OPERATION_LOCK" ]] && sed -n '1,3p' "$OPERATION_LOCK" >&2
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+
+    MUTATION_LOCK_HELD=1
+    if ! printf 'pid\t%s\nstarted_at\t%s\noperation\t%s\n' \
+        "$$" "$(date -u +%FT%TZ)" "$operation" > "$OPERATION_LOCK"; then
+        end_mutation
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+}
+
+end_mutation() {
+    (( MUTATION_LOCK_HELD == 1 )) || return 0
+    : > "$OPERATION_LOCK" || true
+    flock -u "$MUTATION_LOCK_FD" || true
+    eval "exec ${MUTATION_LOCK_FD}>&-"
+    MUTATION_LOCK_HELD=0
+}
+
+end_mutation_if_held() {
+    end_mutation
+}
+
+mutation_signal_exit() {
+    local signal=$1
+    end_mutation_if_held
+    trap - "$signal"
+    kill -s "$signal" "$$"
+}
+
+install_mutation_cleanup_trap() {
+    trap 'end_mutation_if_held' EXIT
+    trap 'mutation_signal_exit INT' INT
+    trap 'mutation_signal_exit TERM' TERM
+    trap 'mutation_signal_exit HUP' HUP
+}
+
+require_mutation_allowed() {
+    if [[ -s "$PROTECTED_LOCK" ]]; then
+        error "检测到保护锁定：${PROTECTED_LOCK}"
+        return "$RESULT_PROTECTED_LOCKOUT"
+    fi
+    return "$RESULT_OK"
 }
 
 # 记录安全检查结果
@@ -2356,6 +2439,7 @@ main_menu() {
 }
 
 main() {
+    install_mutation_cleanup_trap
     require_root || exit 1
 
     if is_streamed_source "${BASH_SOURCE[0]}"; then

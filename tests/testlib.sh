@@ -19,6 +19,21 @@ assert_file_contains() {
     grep -Fq -- "$expected" "$file" || fail "$file lacks: $expected"
 }
 
+assert_contains() {
+    local actual=$1 expected=$2
+    [[ "$actual" == *"$expected"* ]] || fail "text lacks: $expected"
+}
+
+assert_status() {
+    local expected=$1 actual
+    shift
+    set +e
+    "$@"
+    actual=$?
+    set -e
+    assert_eq "$actual" "$expected"
+}
+
 source_manager() {
     LSEC_SOURCE_ONLY=1 source "$TEST_ROOT/linux_security.sh"
 }
