@@ -2067,6 +2067,324 @@ create_forwarding_transaction() {
     return "$RESULT_ROLLBACK_FAILED"
 }
 
+stage_forward_nat_removal() {
+    local staged=$1 marker temp
+    shift
+    (( $# > 0 )) || return 1
+    cp -a "$BEFORE_RULES" "$staged" || return 1
+    for marker in "$@"; do
+        validate_managed_marker "$marker" || return 1
+        temp=$(mktemp "${staged}.tmp.XXXXXX") || return 1
+        if ! awk -v marker="$marker" '
+            index($0, "--comment " marker ":dnat") == 0 &&
+            index($0, "--comment " marker ":snat") == 0 {print}
+        ' "$staged" > "$temp" || ! mv -f -- "$temp" "$staged"; then
+            rm -f -- "$temp"
+            return 1
+        fi
+    done
+}
+
+render_state_without_markers() {
+    local current_state=$1
+    shift
+    awk -F '\t' -v OFS='\t' '
+        BEGIN {
+            for (arg_index = 2; arg_index < ARGC; arg_index++) {
+                removed[ARGV[arg_index]] = 1
+                delete ARGV[arg_index]
+            }
+        }
+        !($1 in removed) {print}
+    ' "$current_state" "$@"
+}
+
+commit_forward_state_removal() {
+    atomic_write "$STATE_FILE" render_state_without_markers "$STATE_FILE" "$@" || return 1
+    atomic_write "$STATE_VERSION_FILE" write_state_schema_version
+}
+
+record_delete_intent() {
+    local batch_id=$1 marker row
+    local target="${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv"
+    shift
+    : > "$target" || return 1
+    for marker in "$@"; do
+        row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print; exit}' "$STATE_FILE")
+        [[ -n "$row" ]] || return 1
+        printf '%s\n' "$row" >> "$target" || return 1
+    done
+    chmod 600 "$target"
+}
+
+ufw_marker_present() {
+    local marker=$1
+    ufw status numbered 2>/dev/null | grep -Fq -- "$marker"
+}
+
+restore_deleted_ufw_rules() {
+    local batch_id=$1
+    local marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch
+    local intended="${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv"
+    [[ -f "$intended" ]] || return 0
+    while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
+        [[ -n "$marker" ]] || continue
+        if ! ufw_marker_present "$marker"; then
+            add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
+                "$landing_ip" "$landing_port" "$marker" || return 1
+        fi
+    done < "$intended"
+}
+
+verify_deleted_ufw_rules_restored() {
+    local batch_id=$1 marker rest
+    local intended="${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv"
+    [[ -f "$intended" ]] || return 0
+    while IFS=$'\t' read -r marker rest; do
+        [[ -n "$marker" ]] || continue
+        ufw_marker_present "$marker" || return 1
+    done < "$intended"
+}
+
+verify_forwarding_markers_absent() {
+    local marker status
+    status=$(ufw status numbered 2>/dev/null) || return 1
+    for marker in "$@"; do
+        grep -Fq -- "$marker" "$BEFORE_RULES" && return 1
+        [[ $(state_marker_count "$marker") == 0 ]] || return 1
+        grep -Fq -- "$marker" <<< "$status" && return 1
+    done
+    return 0
+}
+
+rollback_deleted_forwarding() {
+    local batch_id=$1 result=0
+    restore_transaction_snapshot "$batch_id" || result=1
+    restore_deleted_ufw_rules "$batch_id" || result=1
+    reload_ufw || result=1
+    verify_snapshot_restored "$batch_id" || result=1
+    verify_deleted_ufw_rules_restored "$batch_id" || result=1
+    if (( result == 0 )); then
+        set_transaction_phase "$batch_id" rolled_back
+        return 0
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed '无法验证删除事务恢复'
+    return 1
+}
+
+delete_forwarding_transaction() {
+    local batch_id=$1 staged=$2
+    shift 2
+    local -a markers=("$@")
+    local marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK deleted=0
+
+    (( ${#markers[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
+    validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
+    for marker in "${markers[@]}"; do
+        validate_managed_marker "$marker" || return "$RESULT_PRECHECK_FAILED"
+        state_has_unique_marker "$marker" || return "$RESULT_REPAIR_REQUIRED"
+    done
+    begin_transaction "$batch_id" delete "$(IFS=,; echo "${markers[*]}")" || return "$RESULT_PRECHECK_FAILED"
+    record_delete_intent "$batch_id" "${markers[@]}" || {
+        rollback_deleted_forwarding "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+        return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+    }
+    if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
+        && set_transaction_phase "$batch_id" applying_ufw; then
+        for marker in "${markers[@]}"; do
+            if delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
+                ((deleted += 1))
+            else
+                set_transaction_phase "$batch_id" applying_ufw "UFW 规则删除失败：${marker}" || true
+                break
+            fi
+        done
+        if (( deleted == ${#markers[@]} )) \
+            && set_transaction_phase "$batch_id" committing_state \
+            && commit_forward_state_removal "${markers[@]}" \
+            && reload_ufw \
+            && set_transaction_phase "$batch_id" verifying; then
+            if verify_forwarding_markers_absent "${markers[@]}"; then
+                set_transaction_phase "$batch_id" verified \
+                    && finish_transaction "$batch_id" committed \
+                    && return "$RESULT_OK"
+            else
+                failure_result=$RESULT_VERIFY_FAILED_ROLLED_BACK
+                set_transaction_phase "$batch_id" verifying '删除后本机验证失败' || true
+            fi
+        fi
+    fi
+    if rollback_deleted_forwarding "$batch_id"; then
+        return "$failure_result"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
+find_parameter_collisions() {
+    local proto=$1 source=$2 in_if=$3 public_port=$4 out_if=$5
+    local landing_ip=$6 landing_port=$7 masquerade=$8
+    [[ -f "$STATE_FILE" ]] || return 0
+    awk -F '\t' -v proto="$proto" -v source="$source" -v in_if="$in_if" \
+        -v public_port="$public_port" -v out_if="$out_if" -v landing_ip="$landing_ip" \
+        -v landing_port="$landing_port" -v masquerade="$masquerade" '
+        $2 == proto && $3 == source && $4 == in_if && $5 == public_port &&
+        $6 == out_if && $7 == landing_ip && $8 == landing_port && $9 == masquerade {print $1}
+    ' "$STATE_FILE"
+}
+
+select_collision_rules() {
+    local choice selection selected_marker
+    local -a candidates=("$@") indexes=() selected=()
+    (( ${#candidates[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
+    echo "1) 取消（默认）" >&2
+    echo "2) 明确选择旧规则并覆盖" >&2
+    read -r -p "请选择: " choice
+    [[ "${choice:-1}" == 2 ]] || return "$RESULT_CANCELLED"
+    read -r -p "请输入要覆盖的旧规则序号，多个用逗号分隔: " selection
+    [[ -n "$selection" ]] || return "$RESULT_CANCELLED"
+    selection=${selection// /}
+    IFS=',' read -r -a indexes <<< "$selection"
+    for selection in "${indexes[@]}"; do
+        [[ "$selection" =~ ^[0-9]+$ ]] \
+            && (( 10#$selection >= 1 && 10#$selection <= ${#candidates[@]} )) \
+            || return "$RESULT_PRECHECK_FAILED"
+        selected_marker=${candidates[$((10#$selection - 1))]}
+        if (( ${#selected[@]} == 0 )) || [[ " ${selected[*]} " != *" ${selected_marker} "* ]]; then
+            selected+=("$selected_marker")
+        fi
+    done
+    (( ${#selected[@]} == ${#candidates[@]} )) || return "$RESULT_PRECHECK_FAILED"
+    (IFS=,; printf '%s\n' "${selected[*]}")
+}
+
+stage_forward_nat_replacement() {
+    local staged=$1 batch_id=$2 source=$3 in_if=$4 public_port=$5
+    local out_if=$6 landing_ip=$7 landing_port=$8 masquerade=$9 old_csv=${10}
+    shift 10
+    local original_before_rules=$BEFORE_RULES removal_stage="${staged}.removal"
+    local -a old_markers=()
+    IFS=',' read -r -a old_markers <<< "$old_csv"
+    (( ${#old_markers[@]} > 0 && $# > 0 )) || return 1
+    stage_forward_nat_removal "$removal_stage" "${old_markers[@]}" || return 1
+    BEFORE_RULES=$removal_stage
+    if stage_forward_nat "$staged" "$batch_id" "$source" "$in_if" "$public_port" \
+        "$out_if" "$landing_ip" "$landing_port" "$masquerade" "$@"; then
+        BEFORE_RULES=$original_before_rules
+        rm -f -- "$removal_stage"
+        return 0
+    fi
+    BEFORE_RULES=$original_before_rules
+    rm -f -- "$removal_stage"
+    return 1
+}
+
+render_state_replacement() {
+    local current_state=$1 batch_id=$2 old_csv=$3 source=$4 in_if=$5 public_port=$6
+    local out_if=$7 landing_ip=$8 landing_port=$9 masquerade=${10}
+    shift 10
+    local proto marker
+    local -a old_markers=()
+    IFS=',' read -r -a old_markers <<< "$old_csv"
+    render_state_without_markers "$current_state" "${old_markers[@]}"
+    for proto in "$@"; do
+        marker=$(managed_marker "$batch_id" "$proto")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
+            "$landing_ip" "$landing_port" "$masquerade" "$batch_id"
+    done
+}
+
+commit_forward_state_replacement() {
+    local batch_id=$1 old_csv=$2 source=$3 in_if=$4 public_port=$5 out_if=$6
+    local landing_ip=$7 landing_port=$8 masquerade=$9
+    shift 9
+    atomic_write "$STATE_FILE" render_state_replacement "$STATE_FILE" "$batch_id" "$old_csv" \
+        "$source" "$in_if" "$public_port" "$out_if" "$landing_ip" "$landing_port" \
+        "$masquerade" "$@" || return 1
+    atomic_write "$STATE_VERSION_FILE" write_state_schema_version
+}
+
+rollback_replaced_forwarding() {
+    local batch_id=$1 result=0
+    remove_transaction_ufw_rules "$batch_id" || result=1
+    restore_transaction_snapshot "$batch_id" || result=1
+    restore_deleted_ufw_rules "$batch_id" || result=1
+    reload_ufw || result=1
+    verify_snapshot_restored "$batch_id" || result=1
+    verify_transaction_ufw_rules_absent "$batch_id" || result=1
+    verify_deleted_ufw_rules_restored "$batch_id" || result=1
+    if (( result == 0 )); then
+        set_transaction_phase "$batch_id" rolled_back
+        return 0
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed '无法验证覆盖事务恢复'
+    return 1
+}
+
+replace_forwarding_transaction() {
+    local batch_id=$1 staged=$2 old_csv=$3 source=$4 in_if=$5 public_port=$6
+    local out_if=$7 landing_ip=$8 landing_port=$9 masquerade=${10}
+    shift 10
+    local -a protocols=("$@") old_markers=()
+    local marker proto deleted=0 added=0 failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
+
+    IFS=',' read -r -a old_markers <<< "$old_csv"
+    (( ${#old_markers[@]} > 0 && ${#protocols[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
+    validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
+    for marker in "${old_markers[@]}"; do
+        validate_managed_marker "$marker" && state_has_unique_marker "$marker" \
+            || return "$RESULT_REPAIR_REQUIRED"
+    done
+    begin_transaction "$batch_id" overwrite "$old_csv" || return "$RESULT_PRECHECK_FAILED"
+    record_delete_intent "$batch_id" "${old_markers[@]}" || {
+        rollback_replaced_forwarding "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+        return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+    }
+    if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
+        && set_transaction_phase "$batch_id" applying_ufw; then
+        for marker in "${old_markers[@]}"; do
+            if delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
+                ((deleted += 1))
+            else
+                break
+            fi
+        done
+        if (( deleted == ${#old_markers[@]} )); then
+            for proto in "${protocols[@]}"; do
+                marker=$(managed_marker "$batch_id" "$proto")
+                if record_intended_ufw_marker "$batch_id" "$marker" \
+                    && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
+                        "$landing_ip" "$landing_port" "$marker" \
+                    && record_added_ufw_marker "$batch_id" "$marker"; then
+                    ((added += 1))
+                else
+                    break
+                fi
+            done
+        fi
+        if (( added == ${#protocols[@]} )) \
+            && set_transaction_phase "$batch_id" committing_state \
+            && commit_forward_state_replacement "$batch_id" "$old_csv" "$source" "$in_if" \
+                "$public_port" "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
+            && reload_ufw \
+            && set_transaction_phase "$batch_id" verifying; then
+            if verify_forwarding_markers_absent "${old_markers[@]}" \
+                && verify_forwarding_batch "$batch_id" "${protocols[@]}"; then
+                set_transaction_phase "$batch_id" verified \
+                    && finish_transaction "$batch_id" committed \
+                    && return "$RESULT_OK"
+            else
+                failure_result=$RESULT_VERIFY_FAILED_ROLLED_BACK
+                set_transaction_phase "$batch_id" verifying '覆盖后本机验证失败' || true
+            fi
+        fi
+    fi
+    if rollback_replaced_forwarding "$batch_id"; then
+        return "$failure_result"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
 insert_nat_rule_line() {
     local line=$1
     local tmp
@@ -2259,8 +2577,9 @@ delete_forward_by_id() {
 
 add_forward_rule_interactive_locked() {
     local default_in in_if public_port landing_ip landing_port default_out out_if source proto_choice masquerade
-    local batch_id staged mode description result
-    local -a protocols=()
+    local batch_id staged mode description result proto collision old_csv=
+    local transaction_kind=create
+    local -a protocols=() collision_markers=()
 
     default_in=$(default_interface)
     read -r -p "请输入中转机入站网卡 [默认 ${default_in:-无}]: " in_if
@@ -2302,18 +2621,53 @@ add_forward_rule_interactive_locked() {
         warn "未启用 MASQUERADE 时，必须保证落地机的回程路由经过中转机"
     fi
 
+    for proto in "${protocols[@]}"; do
+        while IFS= read -r collision; do
+            [[ -n "$collision" ]] || continue
+            validate_managed_marker "$collision" || {
+                error "检测到同参数旧格式规则，必须先审计/迁移：${collision}"
+                return "$RESULT_REPAIR_REQUIRED"
+            }
+            if [[ " ${collision_markers[*]} " != *" ${collision} "* ]]; then
+                collision_markers+=("$collision")
+            fi
+        done < <(find_parameter_collisions "$proto" "$source" "$in_if" "$public_port" \
+            "$out_if" "$landing_ip" "$landing_port" "$masquerade")
+    done
+
+    if (( ${#collision_markers[@]} > 0 )); then
+        warn "检测到同参数受管规则："
+        for (( result=0; result<${#collision_markers[@]}; result++ )); do
+            printf '  %d) %s\n' "$((result + 1))" "${collision_markers[$result]}"
+        done
+        if old_csv=$(select_collision_rules "${collision_markers[@]}"); then
+            transaction_kind=overwrite
+        else
+            result=$?
+            (( result == RESULT_PRECHECK_FAILED )) && error "必须明确选中全部同参数旧规则，否则会产生重复行为"
+            return "$result"
+        fi
+    fi
+
     batch_id=$(new_batch_id)
     staged=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
-    if ! stage_forward_nat "$staged" "$batch_id" "$source" "$in_if" "$public_port" \
-        "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
-        || ! validate_staged_nat "$staged"; then
+    result=0
+    if [[ "$transaction_kind" == overwrite ]]; then
+        stage_forward_nat_replacement "$staged" "$batch_id" "$source" "$in_if" "$public_port" \
+            "$out_if" "$landing_ip" "$landing_port" "$masquerade" "$old_csv" "${protocols[@]}" || result=1
+    else
+        stage_forward_nat "$staged" "$batch_id" "$source" "$in_if" "$public_port" \
+            "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" || result=1
+    fi
+    if (( ${result:-0} != 0 )) || ! validate_staged_nat "$staged"; then
         rm -f -- "$staged"
         error "NAT 暂存配置校验失败，未执行任何变更"
         return "$RESULT_PRECHECK_FAILED"
     fi
 
     description="${protocols[*]} ${in_if}:${public_port} -> ${landing_ip}:${landing_port} via ${out_if}, source=${source}, masquerade=${masquerade}"
-    render_execution_preview create "lsec:${batch_id}:{${protocols[*]}}" "$description" \
+    [[ "$transaction_kind" == overwrite ]] && description+="; 删除并重建=${old_csv}"
+    render_execution_preview "$transaction_kind" "lsec:${batch_id}:{${protocols[*]}}" "$description" \
         "$BEFORE_RULES" "$STATE_FILE" '仅在确认执行后按需启用'
     mode=$(select_execution_mode)
     case "$mode" in
@@ -2332,11 +2686,20 @@ add_forward_rule_interactive_locked() {
         rm -f -- "$staged"
         return "$RESULT_PRECHECK_FAILED"
     fi
-    if create_forwarding_transaction "$batch_id" "$staged" "$source" "$in_if" "$public_port" \
-        "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}"; then
-        result=$RESULT_OK
+    if [[ "$transaction_kind" == overwrite ]]; then
+        if replace_forwarding_transaction "$batch_id" "$staged" "$old_csv" "$source" "$in_if" "$public_port" \
+            "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}"; then
+            result=$RESULT_OK
+        else
+            result=$?
+        fi
     else
-        result=$?
+        if create_forwarding_transaction "$batch_id" "$staged" "$source" "$in_if" "$public_port" \
+            "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}"; then
+            result=$RESULT_OK
+        else
+            result=$?
+        fi
     fi
     rm -f -- "$staged"
     return "$result"
@@ -2382,31 +2745,92 @@ add_forward_rule_interactive() {
     return "$result"
 }
 
-delete_forward_rule_interactive() {
-    local selection id
+delete_forward_rule_interactive_locked() {
+    local selection marker staged batch_id mode result
     local -a indexes=()
-    local -a ids=()
+    local -a markers=()
 
     list_forward_rules
     [[ -s "$STATE_FILE" ]] || return 0
+    if [[ ! -f "$STATE_VERSION_FILE" || $(cat "$STATE_VERSION_FILE") != "$STATE_SCHEMA_VERSION" ]]; then
+        error "转发状态尚未迁移，必须先运行审计/迁移"
+        return "$RESULT_REPAIR_REQUIRED"
+    fi
 
     read -r -p "请输入要删除的序号，多个用逗号分隔 [直接回车取消]: " selection
-    [[ -n "$selection" ]] || { warn "已取消"; return 0; }
+    [[ -n "$selection" ]] || return "$RESULT_CANCELLED"
     selection=${selection// /}
     IFS=',' read -r -a indexes <<< "$selection"
 
     for selection in "${indexes[@]}"; do
-        [[ "$selection" =~ ^[0-9]+$ ]] || { warn "忽略无效序号：$selection"; continue; }
-        id=$(awk -F '\t' -v n="$selection" 'NR==n {print $1}' "$STATE_FILE")
-        [[ -n "$id" ]] && ids+=("$id") || warn "序号不存在：$selection"
+        [[ "$selection" =~ ^[0-9]+$ ]] || { error "无效序号：$selection"; return "$RESULT_PRECHECK_FAILED"; }
+        marker=$(awk -F '\t' -v n="$selection" 'NR==n {print $1}' "$STATE_FILE")
+        [[ -n "$marker" ]] || { error "序号不存在：$selection"; return "$RESULT_PRECHECK_FAILED"; }
+        validate_managed_marker "$marker" || { error "规则不是当前版本受管格式：$marker"; return "$RESULT_REPAIR_REQUIRED"; }
+        state_has_unique_marker "$marker" || { error "规则标记不唯一：$marker"; return "$RESULT_REPAIR_REQUIRED"; }
+        markers+=("$marker")
     done
 
-    (( ${#ids[@]} > 0 )) || return 0
-    confirm "确认删除选中的 ${#ids[@]} 条转发规则？" N || { warn "已取消"; return 0; }
+    (( ${#markers[@]} > 0 )) || return "$RESULT_CANCELLED"
+    batch_id=$(new_batch_id)
+    staged=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
+    if ! stage_forward_nat_removal "$staged" "${markers[@]}" || ! validate_staged_nat "$staged"; then
+        rm -f -- "$staged"
+        error "删除后的 NAT 暂存配置校验失败"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    render_execution_preview delete "$(IFS=,; echo "${markers[*]}")" \
+        "删除 ${#markers[@]} 条精确受管规则" "$BEFORE_RULES" "$STATE_FILE" '删除最后规则时另行提示'
+    mode=$(select_execution_mode)
+    case "$mode" in
+        preflight)
+            rm -f -- "$staged"
+            info "删除前置检查与 NAT 语法校验通过，未执行任何变更"
+            return "$RESULT_OK"
+            ;;
+        cancel)
+            rm -f -- "$staged"
+            return "$RESULT_CANCELLED"
+            ;;
+    esac
 
-    for id in "${ids[@]}"; do
-        delete_forward_by_id "$id" || warn "转发规则删除失败：$id"
-    done
+    if delete_forwarding_transaction "$batch_id" "$staged" "${markers[@]}"; then
+        result=$RESULT_OK
+    else
+        result=$?
+    fi
+    rm -f -- "$staged"
+    return "$result"
+}
+
+delete_forward_rule_interactive() {
+    local result
+
+    if begin_mutation "删除完整端口转发"; then :; else
+        result=$?
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if require_mutation_allowed; then :; else
+        result=$?
+        end_mutation
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if run_dependency_preflight; then :; else
+        result=$?
+        end_mutation
+        warn "$(result_message "$result")"
+        return "$result"
+    fi
+    if delete_forward_rule_interactive_locked; then result=$RESULT_OK; else result=$?; fi
+    end_mutation
+    case "$result" in
+        0) ok "$(result_message "$result")" ;;
+        10) warn "$(result_message "$result")" ;;
+        *) error "$(result_message "$result")" ;;
+    esac
+    return "$result"
 }
 
 select_action() {

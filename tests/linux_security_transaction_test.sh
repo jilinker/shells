@@ -199,6 +199,8 @@ stage_forward_nat "$create_staged" batch-success any eth0 52350 eth1 10.0.0.2 52
 UFW_ADDED_MARKERS=()
 UFW_ADD_COUNT=0
 UFW_FAIL_ADD_AT=0
+UFW_DELETE_COUNT=0
+UFW_FAIL_DELETE_AT=0
 ufw() {
     local previous= argument number index
     case "$*" in
@@ -216,6 +218,10 @@ ufw() {
             ;;
     esac
     if [[ "$1" == --force && "$2" == delete ]]; then
+        ((UFW_DELETE_COUNT += 1))
+        if (( UFW_FAIL_DELETE_AT > 0 && UFW_DELETE_COUNT == UFW_FAIL_DELETE_AT )); then
+            return 1
+        fi
         number=$3
         index=$((number - 1))
         if (( ${#UFW_ADDED_MARKERS[@]} == 1 )); then
@@ -383,6 +389,8 @@ assert_contains "$forward_create_definition" 'stage_forward_nat'
 assert_contains "$forward_create_definition" 'render_execution_preview'
 assert_contains "$forward_create_definition" 'select_execution_mode'
 assert_contains "$forward_create_definition" 'create_forwarding_transaction'
+assert_contains "$forward_create_definition" 'find_parameter_collisions'
+assert_contains "$forward_create_definition" 'replace_forwarding_transaction'
 
 original_begin_mutation="$(declare -f begin_mutation)"
 begin_mutation() { return "$RESULT_PRECHECK_FAILED"; }
@@ -396,5 +404,128 @@ configure_state_paths
 BEFORE_RULES="$TEST_TMP/existing-before.rules"
 printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
 assert_status 1 init_state >/dev/null 2>&1
+
+STATE_DIR="$TEST_TMP/delete-success-state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/delete-success-before.rules"
+delete_base="$TEST_TMP/delete-base.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$delete_base"
+BEFORE_RULES="$delete_base"
+stage_forward_nat "$TEST_TMP/delete-live.rules" old-batch any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+BEFORE_RULES="$TEST_TMP/delete-success-before.rules"
+cp "$TEST_TMP/delete-live.rules" "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+render_state_with_forward_batch /dev/null old-batch any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
+: > "$IP_FORWARDING_STATE"
+UFW_ADDED_MARKERS=('lsec:old-batch:tcp' 'lsec:old-batch:udp')
+UFW_DELETE_COUNT=0
+delete_staged="$TEST_TMP/delete-staged.rules"
+delete_live_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+stage_forward_nat_removal "$delete_staged" 'lsec:old-batch:tcp' 'lsec:old-batch:udp'
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$delete_live_hash"
+delete_forwarding_transaction delete-batch "$delete_staged" 'lsec:old-batch:tcp' 'lsec:old-batch:udp'
+assert_not_contains "$(cat "$BEFORE_RULES")" 'lsec:old-batch:'
+assert_eq "$(wc -c < "$STATE_FILE" | tr -d ' ')" 0
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
+assert_file_contains "$TRANSACTION_DIR/delete-batch.txn" $'phase\tcommitted'
+
+STATE_DIR="$TEST_TMP/delete-failure-state"
+configure_state_paths
+delete_failure_base="$TEST_TMP/delete-failure-base.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$delete_failure_base"
+BEFORE_RULES="$delete_failure_base"
+stage_forward_nat "$TEST_TMP/delete-failure-live.rules" old-failure any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+BEFORE_RULES="$TEST_TMP/delete-failure-before.rules"
+cp "$TEST_TMP/delete-failure-live.rules" "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+render_state_with_forward_batch /dev/null old-failure any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
+: > "$IP_FORWARDING_STATE"
+UFW_ADDED_MARKERS=('lsec:old-failure:tcp' 'lsec:old-failure:udp')
+UFW_DELETE_COUNT=0
+UFW_FAIL_DELETE_AT=2
+delete_failure_staged="$TEST_TMP/delete-failure-staged.rules"
+stage_forward_nat_removal "$delete_failure_staged" 'lsec:old-failure:tcp' 'lsec:old-failure:udp'
+delete_failure_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" delete_forwarding_transaction \
+    delete-failure-batch "$delete_failure_staged" 'lsec:old-failure:tcp' 'lsec:old-failure:udp' >/dev/null 2>&1
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$delete_failure_hash"
+assert_eq "$(state_marker_count 'lsec:old-failure:tcp')" 1
+assert_eq "$(state_marker_count 'lsec:old-failure:udp')" 1
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified delete rollback created protected lock'
+UFW_FAIL_DELETE_AT=0
+
+forward_delete_definition="$(declare -f delete_forward_rule_interactive_locked; declare -f delete_forward_rule_interactive)"
+assert_not_contains "$forward_delete_definition" 'delete_forward_by_id'
+assert_contains "$forward_delete_definition" 'stage_forward_nat_removal'
+assert_contains "$forward_delete_definition" 'delete_forwarding_transaction'
+assert_contains "$forward_delete_definition" 'select_execution_mode'
+
+STATE_DIR="$TEST_TMP/replace-success-state"
+configure_state_paths
+replace_base="$TEST_TMP/replace-base.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$replace_base"
+BEFORE_RULES="$replace_base"
+stage_forward_nat "$TEST_TMP/replace-live.rules" replace-old any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+BEFORE_RULES="$TEST_TMP/replace-success-before.rules"
+cp "$TEST_TMP/replace-live.rules" "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+render_state_with_forward_batch /dev/null replace-old any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
+: > "$IP_FORWARDING_STATE"
+assert_eq "$(find_parameter_collisions tcp any eth0 52350 eth1 10.0.0.2 52350 yes)" 'lsec:replace-old:tcp'
+replace_staged="$TEST_TMP/replace-staged.rules"
+stage_forward_nat_replacement "$replace_staged" replace-new any eth0 52350 eth1 10.0.0.2 52350 yes \
+    'lsec:replace-old:tcp,lsec:replace-old:udp' tcp udp
+assert_not_contains "$(cat "$replace_staged")" 'lsec:replace-old:'
+assert_contains "$(cat "$replace_staged")" 'lsec:replace-new:tcp:dnat'
+UFW_ADDED_MARKERS=('lsec:replace-old:tcp' 'lsec:replace-old:udp')
+UFW_ADD_COUNT=0
+UFW_DELETE_COUNT=0
+replace_forwarding_transaction replace-new "$replace_staged" \
+    'lsec:replace-old:tcp,lsec:replace-old:udp' any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+assert_eq "$(state_marker_count 'lsec:replace-old:tcp')" 0
+assert_eq "$(state_marker_count 'lsec:replace-new:tcp')" 1
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
+assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-new:tcp'
+assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-new:udp'
+
+assert_status "$RESULT_CANCELLED" select_collision_rules \
+    'lsec:replace-old:tcp' 'lsec:replace-old:udp' <<< $'1\n' >/dev/null 2>&1
+assert_status "$RESULT_PRECHECK_FAILED" select_collision_rules \
+    'lsec:replace-old:tcp' 'lsec:replace-old:udp' <<< $'2\n1\n' >/dev/null 2>&1
+assert_eq "$(select_collision_rules 'lsec:replace-old:tcp' 'lsec:replace-old:udp' \
+    <<< $'2\n1,2\n' 2>/dev/null)" 'lsec:replace-old:tcp,lsec:replace-old:udp'
+
+STATE_DIR="$TEST_TMP/replace-failure-state"
+configure_state_paths
+replace_failure_base="$TEST_TMP/replace-failure-base.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$replace_failure_base"
+BEFORE_RULES="$replace_failure_base"
+stage_forward_nat "$TEST_TMP/replace-failure-live.rules" replace-restore any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+BEFORE_RULES="$TEST_TMP/replace-failure-before.rules"
+cp "$TEST_TMP/replace-failure-live.rules" "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+render_state_with_forward_batch /dev/null replace-restore any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
+: > "$IP_FORWARDING_STATE"
+replace_failure_staged="$TEST_TMP/replace-failure-staged.rules"
+stage_forward_nat_replacement "$replace_failure_staged" replace-fails any eth0 52350 eth1 10.0.0.2 52350 yes \
+    'lsec:replace-restore:tcp,lsec:replace-restore:udp' tcp udp
+UFW_ADDED_MARKERS=('lsec:replace-restore:tcp' 'lsec:replace-restore:udp')
+UFW_ADD_COUNT=0
+UFW_DELETE_COUNT=0
+UFW_FAIL_ADD_AT=1
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" replace_forwarding_transaction replace-fails \
+    "$replace_failure_staged" 'lsec:replace-restore:tcp,lsec:replace-restore:udp' \
+    any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_eq "$(state_marker_count 'lsec:replace-restore:tcp')" 1
+assert_eq "$(state_marker_count 'lsec:replace-fails:tcp')" 0
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
+assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:tcp'
+assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:udp'
+UFW_FAIL_ADD_AT=0
 
 printf 'linux security transaction test passed\n'
