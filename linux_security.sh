@@ -360,6 +360,7 @@ recover_transaction() {
         overwrite) rollback_replaced_forwarding "$batch_id" ;;
         enable_ufw) rollback_ufw_bootstrap "$batch_id" ;;
         migrate_legacy) rollback_legacy_migration "$batch_id" ;;
+        restore) rollback_replaced_forwarding "$batch_id" ;;
         *)
             protect_failed_transaction "$batch_id" recovery_failed "未知事务类型：${operation}"
             return "$RESULT_ROLLBACK_FAILED"
@@ -433,6 +434,7 @@ snapshot_metadata() {
     printf 'batch_id\t%s\n' "$batch_id"
     printf 'operation\t%s\n' "$operation"
     printf 'created_at\t%s\n' "$(date -u +%FT%TZ)"
+    printf 'created_epoch\t%s\n' "$(date +%s)"
     printf 'status\tactive\n'
 }
 
@@ -499,7 +501,13 @@ set_transaction_phase() {
     local batch_id=$1 phase=$2 last_error=${3:-}
     local journal="${TRANSACTION_DIR}/${batch_id}.txn"
     [[ -f "$journal" ]] || return 1
-    atomic_write "$journal" render_transaction_phase "$journal" "$phase" "$last_error"
+    atomic_write "$journal" render_transaction_phase "$journal" "$phase" "$last_error" || return 1
+    case "$phase" in
+        committed) set_snapshot_status "$batch_id" success ;;
+        rolled_back) set_snapshot_status "$batch_id" failed ;;
+        protected) set_snapshot_status "$batch_id" inconsistent ;;
+        *) return 0 ;;
+    esac
 }
 
 finish_transaction() {
@@ -511,6 +519,170 @@ finish_transaction() {
         return 1
     fi
     set_transaction_phase "$batch_id" "$terminal_phase"
+}
+
+metadata_value() {
+    transaction_value "$1" "$2"
+}
+
+render_snapshot_status() {
+    local metadata=$1 status=$2
+    awk -F '\t' -v OFS='\t' -v status="$status" '
+        $1 == "status" {print "status", status; found=1; next}
+        {print}
+        END {if (!found) print "status", status}
+    ' "$metadata"
+}
+
+set_snapshot_status() {
+    local batch_id=$1 status=$2
+    local metadata="${BACKUP_DIR}/${batch_id}/metadata.tsv"
+    [[ -f "$metadata" ]] || return 1
+    atomic_write "$metadata" render_snapshot_status "$metadata" "$status"
+}
+
+classify_snapshot() {
+    local batch_id=$1 status protected_batch
+    local metadata="${BACKUP_DIR}/${batch_id}/metadata.tsv"
+    [[ -f "$metadata" ]] || { printf 'unverified\n'; return 0; }
+    if [[ -s "$PROTECTED_LOCK" ]]; then
+        protected_batch=$(transaction_value "$PROTECTED_LOCK" batch_id)
+        [[ "$protected_batch" == "$batch_id" ]] && { printf 'protected\n'; return 0; }
+    fi
+    status=$(metadata_value "$metadata" status)
+    case "$status" in
+        success|failed|active|inconsistent) printf '%s\n' "$status" ;;
+        *) printf 'unverified\n' ;;
+    esac
+}
+
+list_snapshots() {
+    local snapshot batch_id status epoch operation metadata
+    [[ -d "$BACKUP_DIR" ]] || return 0
+    for snapshot in "$BACKUP_DIR"/*; do
+        [[ -d "$snapshot" && ! -L "$snapshot" ]] || continue
+        batch_id=${snapshot##*/}
+        [[ "$batch_id" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+        metadata="$snapshot/metadata.tsv"
+        status=$(classify_snapshot "$batch_id")
+        epoch=$(metadata_value "$metadata" created_epoch 2>/dev/null || true)
+        operation=$(metadata_value "$metadata" operation 2>/dev/null || true)
+        printf '%s\t%s\t%s\t%s\n' "$batch_id" "$status" "${epoch:-0}" "${operation:-unknown}"
+    done | sort
+}
+
+eligible_success_snapshots_for_cleanup() {
+    local now_epoch=${1:-$(date +%s)}
+    list_snapshots \
+        | awk -F '\t' '$2 == "success" {print $3 "\t" $1}' \
+        | sort -t $'\t' -k1,1nr \
+        | awk -F '\t' -v now="$now_epoch" 'NR > 20 && now - $1 > 2592000 {print $2}'
+}
+
+cleanup_selected_snapshots() {
+    local now_epoch=$1 batch_id eligible
+    shift
+    local -a selected=("$@")
+    (( ${#selected[@]} > 0 )) || return "$RESULT_CANCELLED"
+    eligible=$(eligible_success_snapshots_for_cleanup "$now_epoch")
+    for batch_id in "${selected[@]}"; do
+        [[ "$batch_id" =~ ^[A-Za-z0-9._-]+$ ]] || return "$RESULT_PRECHECK_FAILED"
+        grep -qxF -- "$batch_id" <<< "$eligible" || return "$RESULT_PRECHECK_FAILED"
+        [[ -d "${BACKUP_DIR}/${batch_id}" && ! -L "${BACKUP_DIR}/${batch_id}" ]] \
+            || return "$RESULT_PRECHECK_FAILED"
+    done
+    for batch_id in "${selected[@]}"; do
+        rm -rf -- "${BACKUP_DIR:?}/${batch_id}" || return "$RESULT_PRECHECK_FAILED"
+    done
+    return "$RESULT_OK"
+}
+
+restore_snapshot_transaction() {
+    local target_batch=$1 restore_batch marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch
+    local target="${BACKUP_DIR}/${target_batch}" target_state current_row result=0
+    local delete_intent
+    [[ "$target_batch" =~ ^[A-Za-z0-9._-]+$ && -d "$target" && ! -L "$target" ]] \
+        || return "$RESULT_PRECHECK_FAILED"
+    [[ $(classify_snapshot "$target_batch") == success ]] || return "$RESULT_PRECHECK_FAILED"
+    [[ -f "$target/before.rules" && -f "$target/forwarding.tsv" && -f "$target/ip-forwarding.tsv" ]] \
+        || return "$RESULT_PRECHECK_FAILED"
+    target_state="$target/forwarding.tsv"
+    if [[ -s "$target_state" ]]; then
+        [[ -f "$target/state.version" && $(cat "$target/state.version") == "$STATE_SCHEMA_VERSION" ]] \
+            || return "$RESULT_REPAIR_REQUIRED"
+    fi
+
+    restore_batch="restore-$(new_batch_id)"
+    begin_transaction "$restore_batch" restore "$target_batch" || return "$RESULT_PRECHECK_FAILED"
+    delete_intent="${BACKUP_DIR}/${restore_batch}/ufw-delete-intended.tsv"
+    install -m 600 /dev/null "$delete_intent" || return "$RESULT_PRECHECK_FAILED"
+    set_transaction_phase "$restore_batch" applying_ufw || result=1
+
+    if (( result == 0 )) && [[ -f "$STATE_FILE" ]]; then
+        while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
+            [[ -n "$marker" ]] || continue
+            if ! awk -F '\t' -v marker="$marker" '$1 == marker {found=1} END {exit found ? 0 : 1}' "$target_state"; then
+                current_row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
+                    "$landing_ip" "$landing_port" "$masquerade" "$original_batch")
+                printf '%s\n' "$current_row" >> "$delete_intent" || { result=1; break; }
+                delete_ufw_rules_by_comment "$marker" || { result=1; break; }
+            fi
+        done < "$STATE_FILE"
+    fi
+
+    if (( result == 0 )); then
+        while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
+            [[ -n "$marker" ]] || continue
+            if ! ufw_marker_present "$marker"; then
+                record_intended_ufw_marker "$restore_batch" "$marker" \
+                    && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" "$landing_ip" "$landing_port" "$marker" \
+                    && record_added_ufw_marker "$restore_batch" "$marker" \
+                    || { result=1; break; }
+            fi
+        done < "$target_state"
+    fi
+
+    if (( result == 0 )) && restore_transaction_snapshot "$target_batch" \
+        && verify_snapshot_restored "$target_batch"; then
+        while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
+            [[ -n "$marker" ]] || continue
+            ufw_marker_present "$marker" || { result=1; break; }
+        done < "$target_state"
+    else
+        result=1
+    fi
+    if (( result == 0 )); then
+        set_transaction_phase "$restore_batch" verified \
+            && finish_transaction "$restore_batch" committed \
+            && return "$RESULT_OK"
+    fi
+    if rollback_replaced_forwarding "$restore_batch"; then
+        return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
+render_transaction_diagnostics() {
+    printf 'lsec transaction diagnostics\n'
+    printf 'generated_at\t%s\n' "$(date -u +%FT%TZ)"
+    printf 'version\t%s\n' "$VERSION"
+    printf '\n[snapshots]\n'
+    list_snapshots
+    printf '\n[incomplete_transactions]\n'
+    scan_incomplete_transactions
+    printf '\n[protected_lock]\n'
+    [[ -f "$PROTECTED_LOCK" ]] && cat "$PROTECTED_LOCK"
+    printf '\n[state_audit]\n'
+    audit_legacy_forwarding_state
+    printf '\n[ufw_status]\n'
+    ufw status verbose 2>&1 || true
+}
+
+export_transaction_diagnostics() {
+    local target=$1
+    install -d -m 700 "$(dirname "$target")" || return 1
+    atomic_write "$target" render_transaction_diagnostics
 }
 
 dependency_available() {
@@ -3419,6 +3591,86 @@ legacy_state_management_interactive() {
     return "$result"
 }
 
+verify_consistent_state() {
+    local audit marker rest status
+    require_current_state_schema || return 1
+    audit=$(audit_legacy_forwarding_state)
+    [[ -z "$audit" ]] && return 0
+    grep -qv $'\tcurrent$' <<< "$audit" && return 1
+    status=$(ufw status numbered 2>/dev/null) || return 1
+    while IFS=$'\t' read -r marker rest; do
+        [[ -n "$marker" ]] || continue
+        grep -Fq -- "--comment ${marker}:dnat" "$BEFORE_RULES" || return 1
+        grep -Fq -- "$marker" <<< "$status" || return 1
+    done < "$STATE_FILE"
+}
+
+attempt_protected_repair() {
+    local batch_id
+    [[ -s "$PROTECTED_LOCK" ]] || return "$RESULT_OK"
+    batch_id=$(transaction_value "$PROTECTED_LOCK" batch_id)
+    recover_transaction "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+    verify_consistent_state || return "$RESULT_PROTECTED_LOCKOUT"
+    rm -f -- "$PROTECTED_LOCK" || return "$RESULT_PROTECTED_LOCKOUT"
+}
+
+transaction_maintenance_menu() {
+    local choice batch_id selection export_path result
+    local -a selected=()
+    while true; do
+        echo "1) 列出备份"
+        echo "2) 恢复选定备份（作为新事务）"
+        echo "3) 清理选定的合规成功备份"
+        echo "4) 导出诊断"
+        echo "5) 尝试修复保护锁"
+        echo "0) 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) list_snapshots ;;
+            2)
+                list_snapshots
+                read -r -p "请输入要恢复的备份 ID [回车取消]: " batch_id
+                [[ -n "$batch_id" ]] || continue
+                confirm "确认以新事务恢复 ${batch_id}？" N || continue
+                if begin_mutation "恢复备份 ${batch_id}"; then :; else continue; fi
+                if require_mutation_allowed && restore_snapshot_transaction "$batch_id"; then
+                    ok "备份已恢复并验证"
+                else
+                    result=$?
+                    error "$(result_message "$result")"
+                fi
+                end_mutation
+                ;;
+            3)
+                eligible_success_snapshots_for_cleanup
+                read -r -p "请输入要清理的备份 ID，多个用逗号分隔 [回车取消]: " selection
+                [[ -n "$selection" ]] || continue
+                selection=${selection// /}
+                IFS=',' read -r -a selected <<< "$selection"
+                confirm "确认永久清理明确选中的 ${#selected[@]} 个备份？" N || continue
+                if begin_mutation "清理事务备份"; then :; else continue; fi
+                if cleanup_selected_snapshots "$(date +%s)" "${selected[@]}"; then
+                    ok "选定备份已清理"
+                else
+                    error "备份不符合清理策略，未执行清理"
+                fi
+                end_mutation
+                ;;
+            4)
+                export_path="/root/lsec-diagnostics-$(date +%Y%m%d%H%M%S).txt"
+                export_transaction_diagnostics "$export_path" && ok "诊断已导出：${export_path}"
+                ;;
+            5)
+                if begin_mutation "修复保护锁"; then :; else continue; fi
+                if attempt_protected_repair; then ok "一致性已验证，保护锁已清除"; else error "修复未通过，保护锁保持"; fi
+                end_mutation
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
 select_action() {
     local direction=$1
     local choice
@@ -3702,6 +3954,7 @@ forward_menu() {
         echo "3) 删除独立 UFW 路由规则（不处理 NAT）"
         echo "4) 查看 UFW 原始规则"
         echo "5) 审计/迁移旧转发状态"
+        echo "6) 事务备份、恢复与诊断"
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
@@ -3715,6 +3968,7 @@ forward_menu() {
                 ;;
             4) ufw show raw || true; pause ;;
             5) if legacy_state_management_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            6) transaction_maintenance_menu; invalidate_ufw_snapshot ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac

@@ -714,4 +714,54 @@ assert_file_contains "$STATE_VERSION_FILE" "$STATE_SCHEMA_VERSION"
 assert_file_contains "$TRANSACTION_DIR/migration-batch.txn" $'phase\tcommitted'
 assert_contains "$(declare -f forward_menu)" 'legacy_state_management_interactive'
 
+STATE_DIR="$TEST_TMP/backup-policy-state"
+configure_state_paths
+mkdir -p "$BACKUP_DIR" "$TRANSACTION_DIR"
+for backup_index in $(seq -w 1 22); do
+    backup_id="backup-${backup_index}"
+    mkdir -p "$BACKUP_DIR/$backup_id"
+    printf 'batch_id\t%s\nstatus\tsuccess\ncreated_epoch\t%s\noperation\tcreate\n' \
+        "$backup_id" "$((10#$backup_index))" > "$BACKUP_DIR/$backup_id/metadata.tsv"
+    printf 'batch_id\t%s\nphase\tcommitted\n' "$backup_id" > "$TRANSACTION_DIR/$backup_id.txn"
+done
+mkdir -p "$BACKUP_DIR/backup-failed"
+printf 'batch_id\tbackup-failed\nstatus\tfailed\ncreated_epoch\t1\noperation\tcreate\n' \
+    > "$BACKUP_DIR/backup-failed/metadata.tsv"
+printf 'batch_id\tbackup-failed\nphase\trolled_back\n' > "$TRANSACTION_DIR/backup-failed.txn"
+eligible_backups="$(eligible_success_snapshots_for_cleanup 4000000)"
+assert_contains "$eligible_backups" 'backup-01'
+assert_contains "$eligible_backups" 'backup-02'
+assert_not_contains "$eligible_backups" 'backup-03'
+assert_not_contains "$eligible_backups" 'backup-failed'
+assert_contains "$(list_snapshots)" $'backup-failed\tfailed'
+
+diagnostic_export="$TEST_TMP/lsec-diagnostics.txt"
+export_transaction_diagnostics "$diagnostic_export"
+assert_eq "$(file_mode "$diagnostic_export")" 600
+assert_file_contains "$diagnostic_export" 'lsec transaction diagnostics'
+
+cleanup_selected_snapshots 4000000 backup-01
+[[ ! -e "$BACKUP_DIR/backup-01" ]] || fail 'eligible selected backup was not removed'
+assert_status "$RESULT_PRECHECK_FAILED" cleanup_selected_snapshots 4000000 backup-03 >/dev/null 2>&1
+[[ -d "$BACKUP_DIR/backup-03" ]] || fail 'protected newest-20 backup was removed'
+assert_status "$RESULT_PRECHECK_FAILED" cleanup_selected_snapshots 4000000 '../escape' >/dev/null 2>&1
+
+STATE_DIR="$TEST_TMP/restore-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+BEFORE_RULES="$TEST_TMP/restore-before.rules"
+UFW_SYSCTL_FILE="$TEST_TMP/restore-sysctl.conf"
+printf 'restore-point\n' > "$BEFORE_RULES"
+printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"
+: > "$STATE_FILE"
+begin_transaction restore-source create none
+set_transaction_phase restore-source verified
+finish_transaction restore-source committed
+printf 'current-mutated\n' > "$BEFORE_RULES"
+restore_snapshot_transaction restore-source
+assert_eq "$(cat "$BEFORE_RULES")" restore-point
+restore_journal=$(grep -l $'operation\trestore' "$TRANSACTION_DIR"/*.txn | head -1)
+assert_file_contains "$restore_journal" $'phase\tcommitted'
+assert_contains "$(declare -f forward_menu)" 'transaction_maintenance_menu'
+
 printf 'linux security transaction test passed\n'
