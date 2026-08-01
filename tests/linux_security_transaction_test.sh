@@ -1086,6 +1086,24 @@ assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
 assert_file_contains "$TRANSACTION_DIR/ufw-failure.txn" $'rollback_status\tverified'
 assert_file_contains "$BACKUP_DIR/ufw-failure/failure/verification.tsv" $'operation\tenable_ufw'
 assert_contains "$(cat "$BOOT_UFW_LOG")" 'delete allow in proto tcp from any to any port 2222 comment lsec:ufw-failure:ssh-2222'
+
+# v4.0.x/schema 2 did not record the typed inbound intent file. Recovery must
+# still remove the exact persistent SSH allow while UFW is inactive.
+begin_transaction legacy-ufw-recovery enable_ufw 2222
+snapshot_ufw_bootstrap legacy-ufw-recovery
+record_intended_ufw_marker legacy-ufw-recovery lsec:legacy-ufw-recovery:ssh-2222
+set_transaction_phase legacy-ufw-recovery applying_ufw
+sed -i.bak -e $'s/^schema\t3$/schema\t2/' \
+    -e '/^failure_/d' -e '/^rollback_/d' -e '/^evidence_error/d' \
+    "$TRANSACTION_DIR/legacy-ufw-recovery.txn"
+rm -f "$TRANSACTION_DIR/legacy-ufw-recovery.txn.bak"
+BOOT_UFW_ACTIVE=no
+BOOT_UFW_MARKERS=('lsec:legacy-ufw-recovery:ssh-2222')
+assert_status 0 recover_transaction legacy-ufw-recovery >/dev/null 2>&1
+assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'schema 2 UFW recovery created protected lock'
+assert_file_contains "$TRANSACTION_DIR/legacy-ufw-recovery.txn" $'phase\trolled_back'
+assert_contains "$(cat "$BOOT_UFW_LOG")" 'delete allow in proto tcp from any to any port 2222 comment lsec:legacy-ufw-recovery:ssh-2222'
 BOOT_UFW_FAIL=
 eval "$original_confirm_ufw_activation"
 BOOT_UFW_MARKERS=('lsec:preview:ssh-2222')

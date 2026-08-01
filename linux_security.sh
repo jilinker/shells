@@ -3540,6 +3540,38 @@ delete_recorded_persistent_ufw_inbound() {
     (( found == 1 ))
 }
 
+delete_schema2_ufw_bootstrap_inbound() {
+    local batch_id=$1 marker=$2
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    local schema operation rule_ids port candidate matched=0 count
+    local prefix="lsec:${batch_id}:ssh-"
+    local -a ports=()
+
+    [[ -f "$journal" ]] || return 1
+    schema=$(transaction_value "$journal" schema) || return 1
+    operation=$(transaction_value "$journal" operation) || return 1
+    rule_ids=$(transaction_value "$journal" rule_ids) || return 1
+    [[ "$schema" == 2 && "$operation" == enable_ufw ]] || return 1
+    [[ "$marker" == "$prefix"* ]] || return 1
+    port=${marker#"$prefix"}
+    validate_port "$port" || return 1
+    [[ "$marker" == "$(managed_marker "$batch_id" "ssh-${port}")" ]] || return 1
+
+    IFS=',' read -r -a ports <<< "$rule_ids"
+    (( ${#ports[@]} > 0 )) || return 1
+    for candidate in "${ports[@]}"; do
+        validate_port "$candidate" || return 1
+        [[ "$candidate" == "$port" ]] && matched=1
+    done
+    (( matched == 1 )) || return 1
+
+    count=$(ufw_persistent_marker_count "$marker") || return 1
+    while (( count > 0 )); do
+        ufw delete allow in proto tcp from any to any port "$port" comment "$marker" || return 1
+        count=$(ufw_persistent_marker_count "$marker") || return 1
+    done
+}
+
 delete_recorded_persistent_ufw_rule() {
     local batch_id=$1 marker=$2
     local route_file="${BACKUP_DIR}/${batch_id}/ufw-intended-routes.tsv"
@@ -3549,7 +3581,7 @@ delete_recorded_persistent_ufw_rule() {
     elif [[ -f "$inbound_file" ]] && awk -F '\t' -v marker="$marker" '$1 == marker {found=1} END {exit found ? 0 : 1}' "$inbound_file"; then
         delete_recorded_persistent_ufw_inbound "$batch_id" "$marker"
     else
-        return 1
+        delete_schema2_ufw_bootstrap_inbound "$batch_id" "$marker"
     fi
 }
 
