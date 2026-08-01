@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="4.0.2"
+VERSION="4.1.0"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -73,6 +73,7 @@ VERIFY_FAILURE_SUMMARY=
 VERIFY_FAILURE_EXPECTED=
 VERIFY_FAILURE_ACTUAL=
 VERIFY_FAILURE_AT=
+LAST_TRANSACTION_BATCH_ID=
 
 configure_state_paths() {
     STATE_FILE="${STATE_DIR}/forwarding.tsv"
@@ -719,8 +720,12 @@ begin_transaction() {
 
     clear_verification_failure
     snapshot_current_state "$batch_id" "$operation" || return 1
-    atomic_write "${TRANSACTION_DIR}/${batch_id}.txn" write_transaction_record \
-        "$batch_id" "$operation" prepared "$snapshot" "$rule_ids" ''
+    if atomic_write "${TRANSACTION_DIR}/${batch_id}.txn" write_transaction_record \
+        "$batch_id" "$operation" prepared "$snapshot" "$rule_ids" ''; then
+        LAST_TRANSACTION_BATCH_ID=$batch_id
+        return 0
+    fi
+    return 1
 }
 
 transaction_value() {
@@ -1112,7 +1117,80 @@ restore_snapshot_transaction() {
     return "$RESULT_ROLLBACK_FAILED"
 }
 
+failure_stage_label() {
+    case ${1:-} in
+        verify_ufw_status) printf 'UFW 状态验证' ;;
+        verify_ufw_persistent) printf 'UFW 持久化规则验证' ;;
+        verify_ufw_runtime) printf 'UFW 运行时规则验证' ;;
+        verify_ipv4_runtime) printf 'IPv4 转发运行时验证' ;;
+        verify_ipv4_persistent) printf 'IPv4 转发持久化验证' ;;
+        verify_state) printf '转发状态文件验证' ;;
+        verify_nat_expected) printf 'NAT 预期规则构建' ;;
+        verify_nat_persistent) printf 'NAT 持久化规则验证' ;;
+        verify_nat_live) printf 'NAT 运行时规则验证' ;;
+        verify_nat_file) printf 'NAT 规则集合验证' ;;
+        recovery) printf '启动事务恢复' ;;
+        applying_ipv4) printf '应用 IPv4 转发' ;;
+        applying_nat) printf '应用 NAT 配置' ;;
+        applying_ufw) printf '应用 UFW 配置' ;;
+        committing_state) printf '提交状态文件' ;;
+        verifying) printf '应用后本机验证' ;;
+        *) printf '%s' "${1:-未知阶段}" ;;
+    esac
+}
+
+render_optional_transaction_detail() {
+    local journal=$1 key=$2 label=$3 value
+    value=$(transaction_value "$journal" "$key" 2>/dev/null || true)
+    if [[ -n "$value" ]]; then
+        printf '%s：%s\n' "$label" "$value"
+    fi
+    return 0
+}
+
+render_transaction_failure_details() {
+    local batch_id=$1 journal stage snapshot failure_dir
+    [[ "$batch_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 1
+    printf '%s\n' '--- 事务失败详情 ---'
+    printf '批次：%s\n' "$batch_id"
+    render_optional_transaction_detail "$journal" operation '操作'
+    stage=$(transaction_value "$journal" failure_stage 2>/dev/null || true)
+    [[ -n "$stage" ]] && printf '失败阶段：%s (%s)\n' "$(failure_stage_label "$stage")" "$stage"
+    render_optional_transaction_detail "$journal" failure_code '失败代码'
+    render_optional_transaction_detail "$journal" failure_protocol '协议'
+    render_optional_transaction_detail "$journal" failure_marker '规则标记'
+    render_optional_transaction_detail "$journal" failure_summary '原因'
+    render_optional_transaction_detail "$journal" failure_expected '预期'
+    render_optional_transaction_detail "$journal" failure_actual '实际'
+    render_optional_transaction_detail "$journal" rollback_status '回滚验证'
+    render_optional_transaction_detail "$journal" rollback_error '回滚错误'
+    render_optional_transaction_detail "$journal" evidence_error '证据采集警告'
+    snapshot=$(transaction_value "$journal" snapshot 2>/dev/null || true)
+    if [[ ${snapshot##*/} == "$batch_id" ]]; then
+        failure_dir="${snapshot}/failure"
+        [[ -d "$failure_dir" ]] && printf '回滚前证据：%s\n' "$failure_dir"
+    fi
+    if [[ -f "$PROTECTED_LOCK" ]]; then
+        printf '保护锁：%s\n' "$PROTECTED_LOCK"
+    fi
+    return 0
+}
+
+show_transaction_failure_details() {
+    render_transaction_failure_details "$1" >&2
+}
+
+show_transaction_failure_for_result() {
+    local result=$1 batch_id=${2:-}
+    case "$result" in 30|40|50) ;; *) return 0 ;; esac
+    [[ -n "$batch_id" ]] || batch_id=$LAST_TRANSACTION_BATCH_ID
+    [[ -n "$batch_id" ]] && show_transaction_failure_details "$batch_id" || true
+}
+
 render_transaction_diagnostics() {
+    local journal batch_id failure_dir evidence_file found=0
     printf 'lsec transaction diagnostics\n'
     printf 'generated_at\t%s\n' "$(date -u +%FT%TZ)"
     printf 'version\t%s\n' "$VERSION"
@@ -1122,6 +1200,34 @@ render_transaction_diagnostics() {
     scan_incomplete_transactions
     printf '\n[protected_lock]\n'
     [[ -f "$PROTECTED_LOCK" ]] && cat "$PROTECTED_LOCK"
+    printf '\n[transaction_journals]\n'
+    if [[ -d "$TRANSACTION_DIR" ]]; then
+        for journal in "$TRANSACTION_DIR"/*.txn; do
+            [[ -f "$journal" ]] || continue
+            found=1
+            batch_id=${journal##*/}
+            batch_id=${batch_id%.txn}
+            printf '\n--- transaction %s ---\n' "$batch_id"
+            cat "$journal"
+        done
+    fi
+    (( found == 1 )) || printf '%s\n' 'none'
+    printf '\n[failure_evidence]\n'
+    found=0
+    if [[ -d "$BACKUP_DIR" ]]; then
+        for failure_dir in "$BACKUP_DIR"/*/failure; do
+            [[ -d "$failure_dir" ]] || continue
+            found=1
+            batch_id=${failure_dir%/failure}
+            batch_id=${batch_id##*/}
+            for evidence_file in "$failure_dir"/*; do
+                [[ -f "$evidence_file" ]] || continue
+                printf '\n--- failure %s / %s ---\n' "$batch_id" "${evidence_file##*/}"
+                cat "$evidence_file"
+            done
+        done
+    fi
+    (( found == 1 )) || printf '%s\n' 'none'
     printf '\n[state_audit]\n'
     audit_legacy_forwarding_state
     printf '\n[ufw_status]\n'
@@ -2675,8 +2781,10 @@ enable_ufw_transaction() {
         fi
     fi
     if rollback_ufw_bootstrap "$batch_id"; then
+        show_transaction_failure_for_result "$failure_result" "$batch_id"
         return "$failure_result"
     fi
+    show_transaction_failure_for_result "$RESULT_ROLLBACK_FAILED" "$batch_id"
     return "$RESULT_ROLLBACK_FAILED"
 }
 
@@ -4565,6 +4673,7 @@ add_forward_rule_interactive_locked() {
         fi
     fi
     rm -f -- "$staged"
+    show_transaction_failure_for_result "$result" "$batch_id"
     return "$result"
 }
 
@@ -4673,6 +4782,7 @@ delete_forward_rule_interactive_locked() {
         result=$?
     fi
     rm -f -- "$staged"
+    show_transaction_failure_for_result "$result" "$batch_id"
     return "$result"
 }
 
@@ -4744,7 +4854,10 @@ legacy_state_management_interactive() {
     end_mutation
     case "$result" in
         0) ok "旧转发状态已迁移并完成本机验证" ;;
-        *) error "$(result_message "$result")" ;;
+        *)
+            error "$(result_message "$result")"
+            show_transaction_failure_for_result "$result" "$batch_id"
+            ;;
     esac
     return "$result"
 }
@@ -4809,6 +4922,7 @@ transaction_maintenance_menu() {
                 else
                     result=$?
                     error "$(result_message "$result")"
+                    show_transaction_failure_for_result "$result" "$LAST_TRANSACTION_BATCH_ID"
                 fi
                 end_mutation
                 ;;

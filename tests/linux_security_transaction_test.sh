@@ -421,6 +421,18 @@ assert_eq "$(file_mode "$evidence_dir")" 700
 assert_eq "$(file_mode "$evidence_dir/verification.tsv")" 600
 set_transaction_rollback_result evidence-batch verified ''
 set_transaction_phase evidence-batch rolled_back
+failure_details=$(render_transaction_failure_details evidence-batch)
+assert_contains "$failure_details" '批次：evidence-batch'
+assert_contains "$failure_details" '失败阶段：NAT 运行时规则验证 (verify_nat_live)'
+assert_contains "$failure_details" '失败代码：NAT_LIVE_DNAT_MISMATCH'
+assert_contains "$failure_details" '协议：tcp'
+assert_contains "$failure_details" '规则标记：lsec:batch-success:tcp'
+assert_contains "$failure_details" '原因：运行时 DNAT 规则与预期不一致'
+assert_contains "$failure_details" '预期：expected'
+assert_contains "$failure_details" '实际：actual'
+assert_contains "$failure_details" '回滚验证：verified'
+assert_contains "$failure_details" '回滚前证据：'
+assert_not_contains "$failure_details" '回滚错误：'
 assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
 cp "$STATE_FILE" "$TEST_TMP/state-before-drift"
 sed 's/\t52350\teth1/\t52351\teth1/' "$TEST_TMP/state-before-drift" > "$STATE_FILE"
@@ -672,6 +684,11 @@ assert_status "$RESULT_ROLLBACK_FAILED" create_forwarding_transaction \
 assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbatch-rollback-fail'
 assert_file_contains "$TRANSACTION_DIR/batch-rollback-fail.txn" $'rollback_status\tfailed'
 assert_file_contains "$TRANSACTION_DIR/batch-rollback-fail.txn" '恢复事务快照文件失败'
+protected_details=$(render_transaction_failure_details batch-rollback-fail)
+assert_contains "$protected_details" '失败代码：TRANSACTION_STEP_FAILED'
+assert_contains "$protected_details" '回滚验证：failed'
+assert_contains "$protected_details" '回滚错误：恢复事务快照文件失败'
+assert_contains "$protected_details" '保护锁：'
 assert_status "$RESULT_PROTECTED_LOCKOUT" require_mutation_allowed >/dev/null 2>&1
 eval "$original_apply_staged"
 eval "$original_restore_snapshot"
@@ -1114,9 +1131,22 @@ assert_not_contains "$(eligible_success_snapshots_for_cleanup 4000000)" 'backup-
 assert_contains "$(list_snapshots)" $'backup-failed\tfailed'
 
 diagnostic_export="$TEST_TMP/lsec-diagnostics.txt"
+BEFORE_RULES="$TEST_TMP/diagnostic-before.rules"
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+: > "$STATE_FILE"
+begin_transaction diagnostic-failure create tcp
+set_verification_failure verify_ufw_persistent UFW_ROUTE_MISSING tcp lsec:diagnostic:tcp \
+    'UFW 持久化路由缺失' expected 'count=0'
+prepare_failed_transaction_rollback diagnostic-failure
+set_transaction_rollback_result diagnostic-failure verified ''
+set_transaction_phase diagnostic-failure rolled_back
 export_transaction_diagnostics "$diagnostic_export"
 assert_eq "$(file_mode "$diagnostic_export")" 600
 assert_file_contains "$diagnostic_export" 'lsec transaction diagnostics'
+assert_file_contains "$diagnostic_export" '[transaction_journals]'
+assert_file_contains "$diagnostic_export" $'failure_code\tUFW_ROUTE_MISSING'
+assert_file_contains "$diagnostic_export" '[failure_evidence]'
+assert_file_contains "$diagnostic_export" 'failure diagnostic-failure / verification.tsv'
 
 cleanup_selected_snapshots 4000000 backup-01
 [[ ! -e "$BACKUP_DIR/backup-01" ]] || fail 'eligible selected backup was not removed'
