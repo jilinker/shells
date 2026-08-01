@@ -383,6 +383,21 @@ iptables-save() {
 }
 assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+valid_snat='-A POSTROUTING -d 10.0.0.2/32 -o eth1 -p tcp -m tcp --dport 52350 -m comment --comment "lsec:strict:tcp:snat" -j MASQUERADE'
+assert_status 0 canonicalize_managed_nat_rules <<< "$valid_snat" >/dev/null
+assert_status 1 canonicalize_managed_nat_rules \
+    <<< "${valid_snat/--dport 52350/--dport 52350 --sport 40000}"
+assert_status 1 canonicalize_managed_nat_rules <<< "${valid_snat/-o eth1/-o eth1 -o eth2}"
+assert_status 1 canonicalize_managed_nat_rules <<< "${valid_snat/-j MASQUERADE/-j ACCEPT}"
+iptables-save() { sed 's/-o eth1/-o eth9/' "$LIVE_NAT_FILE"; }
+assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { sed 's/--dport 52350/--dport 52351/' "$LIVE_NAT_FILE"; }
+assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { sed 's/--to-destination 10.0.0.2:52350/--to-destination 10.0.0.3:52350/' "$LIVE_NAT_FILE"; }
+assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { sed 's/-j DNAT/-j ACCEPT/' "$LIVE_NAT_FILE"; }
+assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 iptables-save() {
     awk '/^-A PREROUTING / {rules[++count]=$0} END {for (i=count; i>=1; i--) print rules[i]}' "$LIVE_NAT_FILE"
     awk '/^-A POSTROUTING / {print}' "$LIVE_NAT_FILE"
