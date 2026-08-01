@@ -163,6 +163,234 @@ require_mutation_allowed() {
     return "$RESULT_OK"
 }
 
+require_current_state_schema() {
+    [[ -s "$STATE_FILE" ]] || return "$RESULT_OK"
+    if [[ -f "$STATE_VERSION_FILE" && $(cat "$STATE_VERSION_FILE" 2>/dev/null) == "$STATE_SCHEMA_VERSION" ]]; then
+        return "$RESULT_OK"
+    fi
+    return "$RESULT_REPAIR_REQUIRED"
+}
+
+audit_legacy_forwarding_state() {
+    local marker proto source in_if public_port out_if landing_ip landing_port masquerade batch extra status
+    local nat_dnat nat_snat ufw_count ufw_status
+    [[ -f "$STATE_FILE" ]] || return 0
+    ufw_status=$(ufw status numbered 2>/dev/null || true)
+    while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch extra; do
+        [[ -n "$marker" ]] || continue
+        status=malformed
+        if [[ -z "$extra" ]] && validate_port "$public_port" && validate_port "$landing_port" \
+            && validate_interface_name "$in_if" && validate_interface_name "$out_if" \
+            && validate_ipv4 "$landing_ip" && [[ "$proto" == tcp || "$proto" == udp ]] \
+            && [[ "$masquerade" == yes || "$masquerade" == no ]]; then
+            if validate_managed_marker "$marker" && [[ -n "$batch" ]]; then
+                status=current
+            elif [[ -z "$batch" ]]; then
+                status=legacy-drift
+                if [[ "$marker" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    nat_dnat=$(awk -v tag="ufw-relay:${marker}:dnat" 'index($0, tag) {count++} END {print count + 0}' "$BEFORE_RULES")
+                    nat_snat=$(awk -v tag="ufw-relay:${marker}:snat" 'index($0, tag) {count++} END {print count + 0}' "$BEFORE_RULES")
+                    ufw_count=$(awk -v tag="ufw-relay:${marker}" 'index($0, tag) {count++} END {print count + 0}' <<< "$ufw_status")
+                    if (( nat_dnat == 1 && ufw_count == 1 )) \
+                        && { [[ "$masquerade" == no && "$nat_snat" == 0 ]] \
+                            || [[ "$masquerade" == yes && "$nat_snat" == 1 ]]; }; then
+                        status=legacy-exact
+                    fi
+                fi
+            fi
+        fi
+        printf '%s\t%s\n' "$marker" "$status"
+    done < "$STATE_FILE"
+}
+
+render_legacy_migration_mapping() {
+    local batch_id=$1 index=0
+    local old_id proto source in_if public_port out_if landing_ip landing_port masquerade extra
+    while IFS=$'\t' read -r old_id proto source in_if public_port out_if landing_ip landing_port masquerade extra; do
+        [[ -n "$old_id" ]] || continue
+        ((index += 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$old_id" "$(managed_marker "$batch_id" "legacy-${index}")" "$proto" "$source" \
+            "$in_if" "$public_port" "$out_if" "$landing_ip" "$landing_port" "$masquerade"
+    done < "$STATE_FILE"
+}
+
+stage_legacy_migration_nat() {
+    local staged=$1 mapping=$2 old_id new_marker rest temp
+    cp -a "$BEFORE_RULES" "$staged" || return 1
+    while IFS=$'\t' read -r old_id new_marker rest; do
+        [[ -n "$old_id" && -n "$new_marker" ]] || continue
+        temp=$(mktemp "${staged}.tmp.XXXXXX") || return 1
+        if ! awk -v old="ufw-relay:${old_id}:" -v new="${new_marker}:" '
+            function replace_literal(text, old, new, position) {
+                while ((position = index(text, old)) > 0) {
+                    text = substr(text, 1, position - 1) new substr(text, position + length(old))
+                }
+                return text
+            }
+            {print replace_literal($0, old, new)}
+        ' "$staged" > "$temp" || ! mv -f -- "$temp" "$staged"; then
+            rm -f -- "$temp"
+            return 1
+        fi
+    done < "$mapping"
+}
+
+render_migrated_forwarding_state() {
+    local mapping=$1 old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    local marker_tail migration_batch
+    while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
+        marker_tail=${marker#lsec:}
+        migration_batch=${marker_tail%%:*}
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
+            "$landing_ip" "$landing_port" "$masquerade" "$migration_batch"
+    done < "$mapping"
+}
+
+restore_legacy_ufw_rules() {
+    local mapping=$1 old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
+        if ! ufw status numbered 2>/dev/null | grep -Fq -- "ufw-relay:${old_id}"; then
+            add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
+                "$landing_ip" "$landing_port" "ufw-relay:${old_id}" || return 1
+        fi
+    done < "$mapping"
+}
+
+rollback_legacy_migration() {
+    local batch_id=$1 mapping="${BACKUP_DIR}/${batch_id}/legacy-mapping.tsv" result=0
+    remove_transaction_ufw_rules "$batch_id" || result=1
+    restore_transaction_snapshot "$batch_id" || result=1
+    restore_legacy_ufw_rules "$mapping" || result=1
+    reload_ufw || result=1
+    verify_snapshot_restored "$batch_id" || result=1
+    if (( result == 0 )); then
+        set_transaction_phase "$batch_id" rolled_back
+        return 0
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed '无法验证旧状态迁移回滚'
+    return 1
+}
+
+migrate_legacy_forwarding_state() {
+    local batch_id=$1 audit mapping staged
+    local old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    audit=$(audit_legacy_forwarding_state)
+    [[ -n "$audit" ]] || return "$RESULT_PRECHECK_FAILED"
+    if awk -F '\t' '$2 != "legacy-exact" {bad=1} END {exit bad ? 0 : 1}' <<< "$audit"; then
+        return "$RESULT_REPAIR_REQUIRED"
+    fi
+    mapping=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
+    staged=$(mktemp) || { rm -f -- "$mapping"; return "$RESULT_PRECHECK_FAILED"; }
+    render_legacy_migration_mapping "$batch_id" > "$mapping" || {
+        rm -f -- "$mapping" "$staged"
+        return "$RESULT_PRECHECK_FAILED"
+    }
+    if ! stage_legacy_migration_nat "$staged" "$mapping" || ! validate_staged_nat "$staged"; then
+        rm -f -- "$mapping" "$staged"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    begin_transaction "$batch_id" migrate_legacy legacy || {
+        rm -f -- "$mapping" "$staged"
+        return "$RESULT_PRECHECK_FAILED"
+    }
+    install -m 600 "$mapping" "${BACKUP_DIR}/${batch_id}/legacy-mapping.tsv" || {
+        rm -f -- "$mapping" "$staged"
+        rollback_legacy_migration "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+        return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+    }
+    if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
+        && set_transaction_phase "$batch_id" applying_ufw; then
+        while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
+            if record_intended_ufw_marker "$batch_id" "$marker" \
+                && delete_ufw_rules_by_comment "ufw-relay:${old_id}" \
+                && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" "$landing_ip" "$landing_port" "$marker" \
+                && record_added_ufw_marker "$batch_id" "$marker"; then
+                :
+            else
+                break
+            fi
+        done < "$mapping"
+        if set_transaction_phase "$batch_id" committing_state \
+            && atomic_write "$STATE_FILE" render_migrated_forwarding_state "$mapping" \
+            && atomic_write "$STATE_VERSION_FILE" write_state_schema_version \
+            && reload_ufw \
+            && set_transaction_phase "$batch_id" verifying \
+            && [[ $(audit_legacy_forwarding_state | awk -F '\t' '$2 == "current" {count++} END {print count + 0}') -gt 0 ]]; then
+            set_transaction_phase "$batch_id" verified \
+                && finish_transaction "$batch_id" committed \
+                && { rm -f -- "$mapping" "$staged"; return "$RESULT_OK"; }
+        fi
+    fi
+    rm -f -- "$mapping" "$staged"
+    if rollback_legacy_migration "$batch_id"; then
+        return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
+scan_incomplete_transactions() {
+    local journal phase batch_id
+    [[ -d "$TRANSACTION_DIR" ]] || return 0
+    for journal in "$TRANSACTION_DIR"/*.txn; do
+        [[ -f "$journal" ]] || continue
+        phase=$(transaction_value "$journal" phase)
+        case "$phase" in
+            committed|rolled_back) continue ;;
+        esac
+        batch_id=$(transaction_value "$journal" batch_id)
+        [[ "$batch_id" =~ ^[A-Za-z0-9._-]+$ ]] && printf '%s\n' "$batch_id"
+    done
+}
+
+recover_transaction() {
+    local batch_id=$1 operation snapshot
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ "$batch_id" =~ ^[A-Za-z0-9._-]+$ && -f "$journal" ]] || return "$RESULT_PRECHECK_FAILED"
+    operation=$(transaction_value "$journal" operation)
+    snapshot="${BACKUP_DIR}/${batch_id}"
+    if [[ ! -d "$snapshot" || ! -f "$snapshot/before.rules" || ! -f "$snapshot/forwarding.tsv" ]]; then
+        protect_failed_transaction "$batch_id" recovery_failed '事务快照缺失，无法自动恢复'
+        return "$RESULT_ROLLBACK_FAILED"
+    fi
+    case "$operation" in
+        create) rollback_created_forwarding "$batch_id" ;;
+        delete) rollback_deleted_forwarding "$batch_id" ;;
+        overwrite) rollback_replaced_forwarding "$batch_id" ;;
+        enable_ufw) rollback_ufw_bootstrap "$batch_id" ;;
+        migrate_legacy) rollback_legacy_migration "$batch_id" ;;
+        *)
+            protect_failed_transaction "$batch_id" recovery_failed "未知事务类型：${operation}"
+            return "$RESULT_ROLLBACK_FAILED"
+            ;;
+    esac
+    if [[ $? -eq 0 ]]; then
+        return "$RESULT_OK"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
+startup_transaction_recovery() {
+    local pending batch_id result=$RESULT_OK
+    pending=$(scan_incomplete_transactions)
+    [[ -n "$pending" ]] || return "$RESULT_OK"
+    warn "检测到未完成事务，开始按日志自动恢复"
+    if begin_mutation "启动事务恢复"; then :; else return $?; fi
+    while IFS= read -r batch_id; do
+        [[ -n "$batch_id" ]] || continue
+        if recover_transaction "$batch_id"; then
+            info "事务 ${batch_id} 已恢复并验证"
+        else
+            result=$?
+            error "事务 ${batch_id} 自动恢复失败，已进入保护锁定"
+            break
+        fi
+    done <<< "$pending"
+    end_mutation
+    return "$result"
+}
+
 # 使用目标文件所在目录中的临时文件，并以 rename 原子替换。
 atomic_write() {
     local destination=$1 writer=$2 temp
@@ -2323,6 +2551,7 @@ create_forwarding_transaction() {
     local -a protocols=("$@")
     local proto marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
+    require_current_state_schema || return $?
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     begin_transaction "$batch_id" create "$(IFS=,; echo "${protocols[*]}")" || return "$RESULT_PRECHECK_FAILED"
     if ! apply_ipv4_forwarding_for_transaction "$batch_id"; then
@@ -2479,6 +2708,7 @@ delete_forwarding_transaction() {
     local -a markers=("$@")
     local marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK deleted=0
 
+    require_current_state_schema || return $?
     (( ${#markers[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     for marker in "${markers[@]}"; do
@@ -2630,6 +2860,7 @@ replace_forwarding_transaction() {
     local -a protocols=("$@") old_markers=()
     local marker proto deleted=0 added=0 failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
+    require_current_state_schema || return $?
     IFS=',' read -r -a old_markers <<< "$old_csv"
     (( ${#old_markers[@]} > 0 && ${#protocols[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
@@ -3145,6 +3376,49 @@ delete_forward_rule_interactive() {
     return "$result"
 }
 
+legacy_state_management_interactive() {
+    local audit choice batch_id result
+    audit=$(audit_legacy_forwarding_state)
+    if [[ -z "$audit" ]]; then
+        info "没有需要迁移的旧转发状态"
+        return "$RESULT_OK"
+    fi
+    echo "旧状态审计结果："
+    printf '%s\n' "$audit"
+    echo "1) 迁移全部 legacy-exact 规则"
+    echo "2) 显示人工处理说明"
+    echo "0) 取消"
+    read -r -p "请选择 [默认 0]: " choice
+    case ${choice:-0} in
+        1)
+            if grep -qv $'\tlegacy-exact$' <<< "$audit"; then
+                error "包含 malformed 或 legacy-drift 项，不能自动迁移；请先人工核对 NAT、UFW 与登记文件"
+                return "$RESULT_REPAIR_REQUIRED"
+            fi
+            ;;
+        2)
+            info "请比对 ${STATE_FILE}、${BEFORE_RULES} 和 ufw status numbered"
+            info "只有三层唯一对应的规则可自动迁移；不确定时保留原规则并导出诊断"
+            return "$RESULT_OK"
+            ;;
+        *) return "$RESULT_CANCELLED" ;;
+    esac
+    if begin_mutation "迁移旧转发状态"; then :; else return $?; fi
+    if require_mutation_allowed; then :; else
+        result=$?
+        end_mutation
+        return "$result"
+    fi
+    batch_id=$(new_batch_id)
+    if migrate_legacy_forwarding_state "$batch_id"; then result=$RESULT_OK; else result=$?; fi
+    end_mutation
+    case "$result" in
+        0) ok "旧转发状态已迁移并完成本机验证" ;;
+        *) error "$(result_message "$result")" ;;
+    esac
+    return "$result"
+}
+
 select_action() {
     local direction=$1
     local choice
@@ -3427,6 +3701,7 @@ forward_menu() {
         echo "2) 删除本脚本管理的完整端口转发"
         echo "3) 删除独立 UFW 路由规则（不处理 NAT）"
         echo "4) 查看 UFW 原始规则"
+        echo "5) 审计/迁移旧转发状态"
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
@@ -3439,6 +3714,7 @@ forward_menu() {
                 pause
                 ;;
             4) ufw show raw || true; pause ;;
+            5) if legacy_state_management_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac
@@ -3748,7 +4024,12 @@ main() {
     fi
 
     case ${1:-} in
-        "") main_menu ;;
+        "")
+            if startup_transaction_recovery; then :; else
+                warn "存在未修复的一致性问题，变更功能将保持锁定；只读检查仍可使用"
+            fi
+            main_menu
+            ;;
         upgrade) upgrade_lsec ;;
         uninstall) uninstall_lsec ;;
         help|-h|--help) show_lsec_usage ;;

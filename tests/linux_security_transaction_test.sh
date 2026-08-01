@@ -661,4 +661,57 @@ detect_ssh_ports() { return 0; }
 assert_status "$RESULT_CANCELLED" setup_and_enable_ufw_locked <<< $'2222\n错误短语\n' >/dev/null 2>&1
 eval "$original_detect_ssh_ports"
 
+STATE_DIR="$TEST_TMP/recovery-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+BEFORE_RULES="$TEST_TMP/recovery-before.rules"
+printf 'original\n' > "$BEFORE_RULES"
+: > "$STATE_FILE"
+UFW_SYSCTL_FILE="$TEST_TMP/recovery-sysctl.conf"
+printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"
+begin_transaction recovery-batch create tcp
+printf 'mutated\n' > "$BEFORE_RULES"
+set_transaction_phase recovery-batch applying_nat
+assert_eq "$(scan_incomplete_transactions)" recovery-batch
+recover_transaction recovery-batch >/dev/null
+assert_eq "$(cat "$BEFORE_RULES")" original
+assert_file_contains "$TRANSACTION_DIR/recovery-batch.txn" $'phase\trolled_back'
+
+printf '%s\n' $'batch_id\tbroken-batch' $'operation\tcreate' $'phase\tapplying_nat' \
+    $'snapshot\t/not/present' > "$TRANSACTION_DIR/broken-batch.txn"
+assert_status "$RESULT_ROLLBACK_FAILED" recover_transaction broken-batch >/dev/null 2>&1
+assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbroken-batch'
+rm -f "$PROTECTED_LOCK" "$TRANSACTION_DIR/broken-batch.txn"
+
+printf 'legacy-id\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\n' > "$STATE_FILE"
+rm -f "$STATE_VERSION_FILE"
+assert_status "$RESULT_REPAIR_REQUIRED" require_current_state_schema
+printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
+    '-A PREROUTING -p tcp --dport 80 -m comment --comment ufw-relay:legacy-id:dnat -j DNAT --to-destination 10.0.0.2:80' \
+    '-A POSTROUTING -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-id:snat -j MASQUERADE' \
+    'COMMIT' > "$BEFORE_RULES"
+BOOT_UFW_MARKERS=('ufw-relay:legacy-id')
+assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-exact'
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-drift'
+: > "$STATE_FILE"
+assert_status 0 require_current_state_schema
+assert_contains "$(declare -f main)" 'startup_transaction_recovery'
+
+printf 'legacy-migrate\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\n' > "$STATE_FILE"
+rm -f "$STATE_VERSION_FILE"
+printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
+    '-A PREROUTING -p tcp --dport 80 -m comment --comment ufw-relay:legacy-migrate:dnat -j DNAT --to-destination 10.0.0.2:80' \
+    '-A POSTROUTING -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-migrate:snat -j MASQUERADE' \
+    'COMMIT' > "$BEFORE_RULES"
+BOOT_UFW_MARKERS=('ufw-relay:legacy-migrate')
+BOOT_UFW_ACTIVE=yes
+migrate_legacy_forwarding_state migration-batch
+assert_eq "$(state_marker_count 'lsec:migration-batch:legacy-1')" 1
+assert_file_contains "$BEFORE_RULES" 'lsec:migration-batch:legacy-1:dnat'
+assert_contains "${BOOT_UFW_MARKERS[*]}" 'lsec:migration-batch:legacy-1'
+assert_file_contains "$STATE_VERSION_FILE" "$STATE_SCHEMA_VERSION"
+assert_file_contains "$TRANSACTION_DIR/migration-batch.txn" $'phase\tcommitted'
+assert_contains "$(declare -f forward_menu)" 'legacy_state_management_interactive'
+
 printf 'linux security transaction test passed\n'
