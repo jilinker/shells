@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="4.0.1"
+VERSION="4.0.2"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -2887,33 +2887,36 @@ normalize_iptables_rule_for_delete() {
 
 verify_nat_marker_effective() {
     local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch
-    local expected_dnat expected_snat live_nat dnat_count snat_count
+    local expected_dnat expected_snat persisted_dnat persisted_snat live_nat live_dnat live_snat
     row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print}' "$STATE_FILE") || return 1
     [[ $(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}') == 1 ]] || return 1
     IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch <<< "$row"
     expected_dnat=$(render_expected_dnat_rule "$marker" "$proto" "$source" "$in_if" \
-        "$public_port" "$landing_ip" "$landing_port" | normalize_iptables_rule) || return 1
+        "$public_port" "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules) || return 1
     expected_snat=$(render_expected_snat_rule "$marker" "$proto" "$out_if" \
-        "$landing_ip" "$landing_port" | normalize_iptables_rule) || return 1
-    [[ $(awk -v tag="--comment ${marker}:dnat" 'index($0, tag) {print}' "$BEFORE_RULES" \
-        | normalize_iptables_rule) == "$expected_dnat" ]] || return 1
-    local persisted_snat
-    persisted_snat=$(awk -v tag="--comment ${marker}:snat" 'index($0, tag) {print}' "$BEFORE_RULES" \
-        | normalize_iptables_rule) || return 1
+        "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules) || return 1
+    persisted_dnat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
+        | managed_nat_rules_for_marker_and_chain "$marker" PREROUTING \
+        | canonicalize_managed_nat_rules) || return 1
+    [[ "$persisted_dnat" == "$expected_dnat" ]] || return 1
+    persisted_snat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
+        | managed_nat_rules_for_marker_and_chain "$marker" POSTROUTING \
+        | canonicalize_managed_nat_rules) || return 1
     if [[ "$masquerade" == yes ]]; then
         [[ "$persisted_snat" == "$expected_snat" ]] || return 1
     else
         [[ -z "$persisted_snat" ]] || return 1
     fi
-    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
-    dnat_count=$(awk -v expected="$expected_dnat" '$0 == expected {count++} END {print count + 0}' <<< "$live_nat")
-    [[ "$dnat_count" == 1 ]] || return 1
-    snat_count=$(awk -v marker="${marker}:snat" 'index($0, "--comment " marker) {count++} END {print count + 0}' <<< "$live_nat")
+    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
+    live_dnat=$(managed_nat_rules_for_marker_and_chain "$marker" PREROUTING <<< "$live_nat" \
+        | canonicalize_managed_nat_rules) || return 1
+    [[ "$live_dnat" == "$expected_dnat" ]] || return 1
+    live_snat=$(managed_nat_rules_for_marker_and_chain "$marker" POSTROUTING <<< "$live_nat" \
+        | canonicalize_managed_nat_rules) || return 1
     if [[ "$masquerade" == yes ]]; then
-        [[ "$snat_count" == 1 ]] || return 1
-        grep -qxF -- "$expected_snat" <<< "$live_nat" || return 1
+        [[ "$live_snat" == "$expected_snat" ]] || return 1
     else
-        [[ "$snat_count" == 0 ]] || return 1
+        [[ -z "$live_snat" ]] || return 1
     fi
 }
 
@@ -3041,6 +3044,22 @@ managed_nat_rules_for_chain() {
             }
         }
     '
+}
+
+managed_nat_rules_for_marker_and_chain() {
+    local marker=$1 chain=$2
+    validate_nat_ownership_marker "$marker" || return 1
+    managed_nat_rules_for_chain "$chain" | awk \
+        -v dnat="${marker}:dnat" -v snat="${marker}:snat" '
+            {
+                for (i = 1; i < NF; i++) {
+                    if ($i == "--comment" && ($(i + 1) == dnat || $(i + 1) == snat)) {
+                        print
+                        break
+                    }
+                }
+            }
+        '
 }
 
 canonicalize_managed_nat_rules() {

@@ -123,6 +123,8 @@ live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump" \
 
 Capture `live_dump` with `normalize_iptables_rule_for_delete`. Do not sort either result.
 
+Update `verify_nat_marker_effective` to canonicalize its expected, persisted, and live DNAT/SNAT rules through the same strict field parser. Filter by an exact marker token before canonicalization so the final transaction verification accepts backend option reordering while still requiring exactly one matching rule.
+
 - [ ] **Step 3: Run the regression test and confirm GREEN**
 
 Run:

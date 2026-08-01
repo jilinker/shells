@@ -382,6 +382,7 @@ iptables-save() {
             -e 's#^-A POSTROUTING -o ([^ ]+) -p (tcp|udp) -d ([0-9.]+) --dport ([^ ]+) -m comment --comment ([^ ]+) -j MASQUERADE$#-A POSTROUTING -d \3/32 -o \1 -p \2 -m \2 --dport \4 -m comment --comment "\5" -j MASQUERADE#'
 }
 assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
+assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 valid_snat='-A POSTROUTING -d 10.0.0.2/32 -o eth1 -p tcp -m tcp --dport 52350 -m comment --comment "lsec:strict:tcp:snat" -j MASQUERADE'
 assert_status 0 canonicalize_managed_nat_rules <<< "$valid_snat" >/dev/null
