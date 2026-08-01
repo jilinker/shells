@@ -138,6 +138,23 @@ set_transaction_phase "$batch_id" verified
 finish_transaction "$batch_id" committed
 assert_file_contains "$journal_file" $'phase\tcommitted'
 
+literal_escapes=$'literal\\n\\t\\\\path'
+begin_transaction escape-journal create tcp
+set_verification_failure verifying ESCAPE_TEST tcp lsec:escape:tcp \
+    "$literal_escapes" "$literal_escapes" "$literal_escapes"
+record_transaction_failure escape-journal
+set_transaction_rollback_result escape-journal failed "$literal_escapes"
+set_transaction_evidence_error escape-journal "$literal_escapes"
+set_transaction_phase escape-journal applying_nat "$literal_escapes"
+escape_journal="$TRANSACTION_DIR/escape-journal.txn"
+assert_eq "$(transaction_value "$escape_journal" failure_actual)" "$literal_escapes"
+assert_eq "$(transaction_value "$escape_journal" rollback_error)" "$literal_escapes"
+assert_eq "$(transaction_value "$escape_journal" evidence_error)" "$literal_escapes"
+assert_eq "$(transaction_value "$escape_journal" last_error)" "$literal_escapes"
+assert_eq "$(awk -F '\t' '$1 == "failure_actual" {count++} END {print count + 0}' "$escape_journal")" 1
+set_transaction_phase escape-journal verified
+finish_transaction escape-journal committed
+
 for valid_spec in 80 80,443 10000:10100 53,80:90,443; do
     assert_status 0 validate_port_spec "$valid_spec"
 done
@@ -324,6 +341,17 @@ ufw() {
             return 0
             ;;
     esac
+    if [[ "$1" == route && "$2" == delete ]]; then
+            previous=
+            for argument in "$@"; do
+                if [[ "$previous" == comment ]]; then
+                    UFW_SHOW_ADDED_OVERRIDE=
+                    return 0
+                fi
+                previous=$argument
+            done
+            return 1
+    fi
     if [[ "$1" == --force && "$2" == delete ]]; then
         ((UFW_DELETE_COUNT += 1))
         if (( UFW_FAIL_DELETE_AT > 0 && UFW_DELETE_COUNT == UFW_FAIL_DELETE_AT )); then
@@ -393,6 +421,14 @@ original_ipv4_apply="$(declare -f apply_ipv4_forwarding_for_transaction 2>/dev/n
 original_verify_ipv4="$(declare -f verify_ipv4_forwarding_effective)"
 apply_ipv4_forwarding_for_transaction() { return 0; }
 verify_ipv4_forwarding_effective() { return 0; }
+UFW_ACTIVE=0
+assert_status "$RESULT_PRECHECK_FAILED" create_forwarding_transaction \
+    batch-inactive "$create_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+preflight_details=$(render_current_verification_failure_details)
+assert_contains "$preflight_details" '失败代码：UFW_INACTIVE'
+assert_contains "$preflight_details" 'UFW 当前未启用'
+[[ ! -e "$TRANSACTION_DIR/batch-inactive.txn" ]] || fail 'inactive UFW started a transaction'
+UFW_ACTIVE=1
 printf '%s\n' \
     '-A PREROUTING -p tcp --dport 6000 -m comment --comment lsec:anything:dnat -j DNAT --to-destination 10.0.0.9:6000' \
     '-A POSTROUTING -p tcp -m comment --comment ufw-relay:bad;id:snat -j MASQUERADE' >> "$LIVE_NAT_FILE"
@@ -410,6 +446,8 @@ assert_file_contains "$BEFORE_RULES" 'lsec:batch-success:tcp:dnat'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:tcp\ttcp'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:udp\tudp'
 assert_file_contains "$TRANSACTION_DIR/batch-success.txn" $'phase\tcommitted'
+assert_status 1 verify_forwarding_markers_absent 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" NAT_PERSISTED_RULE_REMAINS
 begin_transaction evidence-batch create tcp
 set_verification_failure verify_nat_live NAT_LIVE_DNAT_MISMATCH tcp lsec:batch-success:tcp \
     '运行时 DNAT 规则与预期不一致' expected actual
@@ -458,6 +496,20 @@ assert_eq "$VERIFY_FAILURE_CODE" UFW_RUNTIME_MARKER_MISSING
 UFW_ADDED_MARKERS=('lsec:batch-success:tcp' 'lsec:batch-success:tcp')
 assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
 assert_eq "$VERIFY_FAILURE_CODE" UFW_RUNTIME_MARKER_DUPLICATE
+UFW_ADDED_MARKERS=("${saved_ufw_markers[@]}")
+UFW_SHOW_ADDED_OVERRIDE=
+saved_ufw_markers=("${UFW_ADDED_MARKERS[@]}")
+UFW_ADDED_MARKERS=()
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment 'lsec:batch-success:tcp'"
+assert_status 1 verify_transaction_ufw_rules_absent batch-success
+remove_transaction_ufw_rules batch-success
+assert_status 0 verify_transaction_ufw_rules_absent batch-success
+UFW_ADDED_MARKERS=("${saved_ufw_markers[@]}")
+UFW_SHOW_ADDED_OVERRIDE=
+UFW_ADDED_MARKERS=()
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment 'lsec:absent:tcp'"
+assert_status 1 verify_forwarding_markers_absent 'lsec:absent:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_PERSISTENT_MARKER_REMAINS
 UFW_ADDED_MARKERS=("${saved_ufw_markers[@]}")
 UFW_SHOW_ADDED_OVERRIDE=
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {gsub(/-p tcp/, "-p tcp -m tcp"); gsub(/-d 10.0.0.2/, "-d 10.0.0.2\/32"); print}' "$LIVE_NAT_FILE"; }
@@ -672,6 +724,23 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-reload-noop "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'reload no-op with verified rollback activated protected lock'
 UFW_RELOAD_SYNC=1
+eval "$original_ipv4_apply"
+
+prepare_create_failure_case batch-terminal-write-fail
+apply_ipv4_forwarding_for_transaction() { return 0; }
+apply_staged_nat_file() { return 1; }
+original_set_transaction_phase_definition="$(declare -f set_transaction_phase)"
+eval "${original_set_transaction_phase_definition/set_transaction_phase/set_transaction_phase_original}"
+set_transaction_phase() {
+    [[ "$2" != rolled_back ]] || return 1
+    set_transaction_phase_original "$@"
+}
+assert_status "$RESULT_ROLLBACK_FAILED" create_forwarding_transaction \
+    batch-terminal-write-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbatch-terminal-write-fail'
+assert_file_contains "$PROTECTED_LOCK" '写入已验证回滚终态失败'
+eval "$original_set_transaction_phase_definition"
+eval "$original_apply_staged"
 eval "$original_ipv4_apply"
 
 original_restore_snapshot="$(declare -f restore_transaction_snapshot)"

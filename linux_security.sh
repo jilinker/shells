@@ -314,6 +314,10 @@ require_current_state_schema() {
     if [[ -f "$STATE_VERSION_FILE" && $(cat "$STATE_VERSION_FILE" 2>/dev/null) == "$STATE_SCHEMA_VERSION" ]]; then
         return "$RESULT_OK"
     fi
+    set_verification_failure verify_state STATE_SCHEMA_MISSING_OR_UNSUPPORTED '' '' \
+        '非空转发状态缺少当前 schema 标记，必须先审计或迁移' \
+        "state.version=${STATE_SCHEMA_VERSION}" \
+        "state.version=$(cat "$STATE_VERSION_FILE" 2>/dev/null || printf absent)"
     return "$RESULT_REPAIR_REQUIRED"
 }
 
@@ -449,22 +453,23 @@ rollback_legacy_migration() {
     verify_legacy_ufw_mapping "$mapping" \
         || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '旧 UFW 路由恢复验证失败'); }
     if (( result == 0 )); then
-        set_transaction_rollback_result "$batch_id" verified '' || true
-        set_transaction_phase "$batch_id" rolled_back
-        return 0
+        if complete_verified_rollback "$batch_id"; then return 0; fi
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入已验证回滚终态失败')
     fi
-    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
-    protect_failed_transaction "$batch_id" rollback_failed '无法验证旧状态迁移回滚'
-    return 1
+    record_failed_rollback_and_protect "$batch_id" '无法验证旧状态迁移回滚' "$rollback_errors"
 }
 
 migrate_legacy_forwarding_state() {
     local batch_id=$1 audit mapping staged
     local old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
     local expected_count processed_count=0
+    clear_verification_failure
     audit=$(audit_legacy_forwarding_state)
     [[ -n "$audit" ]] || return "$RESULT_PRECHECK_FAILED"
+    require_active_ufw_for_forwarding || return "$RESULT_PRECHECK_FAILED"
     if awk -F '\t' '$2 != "legacy-exact" {bad=1} END {exit bad ? 0 : 1}' <<< "$audit"; then
+        set_verification_failure verify_state LEGACY_STATE_DRIFT '' '' \
+            '旧转发状态包含漂移或格式错误，不能自动迁移' 'all entries legacy-exact' "$audit"
         return "$RESULT_REPAIR_REQUIRED"
     fi
     verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
@@ -500,7 +505,8 @@ migrate_legacy_forwarding_state() {
     if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
         && set_transaction_phase "$batch_id" applying_ufw; then
         while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
-            if record_intended_ufw_marker "$batch_id" "$marker" \
+            if record_intended_ufw_marker "$batch_id" "$marker" "$proto" "$source" \
+                "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                 && verify_ufw_route_definition "ufw-relay:${old_id}" "$proto" "$source" \
                     "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                 && delete_ufw_rules_by_comment "ufw-relay:${old_id}" \
@@ -735,23 +741,23 @@ transaction_value() {
 
 render_transaction_failure() {
     local journal=$1
-    awk -F '\t' -v OFS='\t' \
-        -v failure_stage="$VERIFY_FAILURE_STAGE" \
-        -v failure_code="$VERIFY_FAILURE_CODE" \
-        -v failure_protocol="$VERIFY_FAILURE_PROTOCOL" \
-        -v failure_marker="$VERIFY_FAILURE_MARKER" \
-        -v failure_summary="$VERIFY_FAILURE_SUMMARY" \
-        -v failure_expected="$VERIFY_FAILURE_EXPECTED" \
-        -v failure_actual="$VERIFY_FAILURE_ACTUAL" \
-        -v failure_at="$VERIFY_FAILURE_AT" '
-        $1 == "failure_stage" {print $1, failure_stage; next}
-        $1 == "failure_code" {print $1, failure_code; next}
-        $1 == "failure_protocol" {print $1, failure_protocol; next}
-        $1 == "failure_marker" {print $1, failure_marker; next}
-        $1 == "failure_summary" {print $1, failure_summary; next}
-        $1 == "failure_expected" {print $1, failure_expected; next}
-        $1 == "failure_actual" {print $1, failure_actual; next}
-        $1 == "failure_at" {print $1, failure_at; next}
+    LSEC_TX_FAILURE_STAGE="$VERIFY_FAILURE_STAGE" \
+    LSEC_TX_FAILURE_CODE="$VERIFY_FAILURE_CODE" \
+    LSEC_TX_FAILURE_PROTOCOL="$VERIFY_FAILURE_PROTOCOL" \
+    LSEC_TX_FAILURE_MARKER="$VERIFY_FAILURE_MARKER" \
+    LSEC_TX_FAILURE_SUMMARY="$VERIFY_FAILURE_SUMMARY" \
+    LSEC_TX_FAILURE_EXPECTED="$VERIFY_FAILURE_EXPECTED" \
+    LSEC_TX_FAILURE_ACTUAL="$VERIFY_FAILURE_ACTUAL" \
+    LSEC_TX_FAILURE_AT="$VERIFY_FAILURE_AT" \
+    awk -F '\t' -v OFS='\t' '
+        $1 == "failure_stage" {print $1, ENVIRON["LSEC_TX_FAILURE_STAGE"]; next}
+        $1 == "failure_code" {print $1, ENVIRON["LSEC_TX_FAILURE_CODE"]; next}
+        $1 == "failure_protocol" {print $1, ENVIRON["LSEC_TX_FAILURE_PROTOCOL"]; next}
+        $1 == "failure_marker" {print $1, ENVIRON["LSEC_TX_FAILURE_MARKER"]; next}
+        $1 == "failure_summary" {print $1, ENVIRON["LSEC_TX_FAILURE_SUMMARY"]; next}
+        $1 == "failure_expected" {print $1, ENVIRON["LSEC_TX_FAILURE_EXPECTED"]; next}
+        $1 == "failure_actual" {print $1, ENVIRON["LSEC_TX_FAILURE_ACTUAL"]; next}
+        $1 == "failure_at" {print $1, ENVIRON["LSEC_TX_FAILURE_AT"]; next}
         {print}
     ' "$journal"
 }
@@ -768,9 +774,10 @@ record_transaction_failure() {
 
 render_transaction_rollback_result() {
     local journal=$1 status=$2 detail=${3:-}
-    awk -F '\t' -v OFS='\t' -v status="$status" -v detail="$detail" '
-        $1 == "rollback_status" {print $1, status; next}
-        $1 == "rollback_error" {print $1, detail; next}
+    LSEC_TX_ROLLBACK_STATUS="$status" LSEC_TX_ROLLBACK_DETAIL="$detail" \
+    awk -F '\t' -v OFS='\t' '
+        $1 == "rollback_status" {print $1, ENVIRON["LSEC_TX_ROLLBACK_STATUS"]; next}
+        $1 == "rollback_error" {print $1, ENVIRON["LSEC_TX_ROLLBACK_DETAIL"]; next}
         {print}
     ' "$journal"
 }
@@ -786,8 +793,8 @@ set_transaction_rollback_result() {
 
 render_transaction_evidence_error() {
     local journal=$1 detail=${2:-}
-    awk -F '\t' -v OFS='\t' -v detail="$detail" '
-        $1 == "evidence_error" {print $1, detail; next}
+    LSEC_TX_EVIDENCE_DETAIL="$detail" awk -F '\t' -v OFS='\t' '
+        $1 == "evidence_error" {print $1, ENVIRON["LSEC_TX_EVIDENCE_DETAIL"]; next}
         {print}
     ' "$journal"
 }
@@ -898,13 +905,29 @@ append_rollback_error() {
     append_diagnostic_error "$current" "$detail"
 }
 
+complete_verified_rollback() {
+    local batch_id=$1
+    set_transaction_rollback_result "$batch_id" verified '' \
+        && set_transaction_phase "$batch_id" rolled_back
+}
+
+record_failed_rollback_and_protect() {
+    local batch_id=$1 reason=$2 rollback_errors=$3
+    if ! set_transaction_rollback_result "$batch_id" failed "$rollback_errors"; then
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入回滚失败结果失败')
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed \
+        "${reason}：${rollback_errors}" || true
+    return 1
+}
+
 render_transaction_phase() {
     local journal=$1 phase=$2 last_error=${3:-}
-    awk -F '\t' -v OFS='\t' -v phase="$phase" -v now="$(date -u +%FT%TZ)" \
-        -v last_error="$last_error" '
-        $1 == "phase" {print "phase", phase; next}
-        $1 == "updated_at" {print "updated_at", now; next}
-        $1 == "last_error" {print "last_error", last_error; next}
+    LSEC_TX_PHASE="$phase" LSEC_TX_NOW="$(date -u +%FT%TZ)" LSEC_TX_LAST_ERROR="$last_error" \
+    awk -F '\t' -v OFS='\t' '
+        $1 == "phase" {print "phase", ENVIRON["LSEC_TX_PHASE"]; next}
+        $1 == "updated_at" {print "updated_at", ENVIRON["LSEC_TX_NOW"]; next}
+        $1 == "last_error" {print "last_error", ENVIRON["LSEC_TX_LAST_ERROR"]; next}
         {print}
     ' "$journal"
 }
@@ -913,6 +936,8 @@ set_transaction_phase() {
     local batch_id=$1 phase=$2 last_error=${3:-}
     local journal="${TRANSACTION_DIR}/${batch_id}.txn"
     [[ -f "$journal" ]] || return 1
+    phase=$(sanitize_transaction_value "$phase")
+    last_error=$(sanitize_transaction_value "$last_error")
     atomic_write "$journal" render_transaction_phase "$journal" "$phase" "$last_error" || return 1
     case "$phase" in
         committed) set_snapshot_status "$batch_id" success ;;
@@ -1082,7 +1107,8 @@ restore_snapshot_transaction() {
                 verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
                     "$landing_ip" "$landing_port" || { result=1; break; }
             else
-                record_intended_ufw_marker "$restore_batch" "$marker" \
+                record_intended_ufw_marker "$restore_batch" "$marker" "$proto" "$source" \
+                    "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                     && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" "$landing_ip" "$landing_port" "$marker" \
                     && record_added_ufw_marker "$restore_batch" "$marker" \
                     || { result=1; break; }
@@ -1129,6 +1155,7 @@ failure_stage_label() {
         verify_nat_persistent) printf 'NAT 持久化规则验证' ;;
         verify_nat_live) printf 'NAT 运行时规则验证' ;;
         verify_nat_file) printf 'NAT 规则集合验证' ;;
+        verify_absence) printf '删除后残留验证' ;;
         recovery) printf '启动事务恢复' ;;
         applying_ipv4) printf '应用 IPv4 转发' ;;
         applying_nat) printf '应用 NAT 配置' ;;
@@ -1178,15 +1205,35 @@ render_transaction_failure_details() {
     return 0
 }
 
+render_current_verification_failure_details() {
+    verification_failure_present || return 1
+    printf '%s\n' '--- 前置检查失败详情 ---'
+    [[ -n "$VERIFY_FAILURE_STAGE" ]] \
+        && printf '失败阶段：%s (%s)\n' "$(failure_stage_label "$VERIFY_FAILURE_STAGE")" "$VERIFY_FAILURE_STAGE"
+    printf '失败代码：%s\n' "$VERIFY_FAILURE_CODE"
+    [[ -n "$VERIFY_FAILURE_PROTOCOL" ]] && printf '协议：%s\n' "$VERIFY_FAILURE_PROTOCOL"
+    [[ -n "$VERIFY_FAILURE_MARKER" ]] && printf '规则标记：%s\n' "$VERIFY_FAILURE_MARKER"
+    [[ -n "$VERIFY_FAILURE_SUMMARY" ]] && printf '原因：%s\n' "$VERIFY_FAILURE_SUMMARY"
+    [[ -n "$VERIFY_FAILURE_EXPECTED" ]] && printf '预期：%s\n' "$VERIFY_FAILURE_EXPECTED"
+    [[ -n "$VERIFY_FAILURE_ACTUAL" ]] && printf '实际：%s\n' "$VERIFY_FAILURE_ACTUAL"
+    return 0
+}
+
 show_transaction_failure_details() {
     render_transaction_failure_details "$1" >&2
 }
 
 show_transaction_failure_for_result() {
-    local result=$1 batch_id=${2:-}
-    case "$result" in 30|40|50) ;; *) return 0 ;; esac
-    [[ -n "$batch_id" ]] || batch_id=$LAST_TRANSACTION_BATCH_ID
-    [[ -n "$batch_id" ]] && show_transaction_failure_details "$batch_id" || true
+    local result=$1 batch_id=${2:-} journal
+    case "$result" in 20|30|40|50|70) ;; *) return 0 ;; esac
+    if [[ -n "$batch_id" ]]; then
+        journal="${TRANSACTION_DIR}/${batch_id}.txn"
+        if [[ -f "$journal" && -n $(transaction_value "$journal" failure_code 2>/dev/null || true) ]]; then
+            show_transaction_failure_details "$batch_id" || true
+            return 0
+        fi
+    fi
+    render_current_verification_failure_details >&2 || true
 }
 
 render_transaction_diagnostics() {
@@ -2318,6 +2365,16 @@ is_ufw_active() {
     ufw status 2>/dev/null | grep -q '^Status: active$'
 }
 
+require_active_ufw_for_forwarding() {
+    if is_ufw_active; then
+        return 0
+    fi
+    set_verification_failure verify_ufw_status UFW_INACTIVE '' '' \
+        'UFW 当前未启用，不能执行完整端口转发事务' 'Status: active' \
+        'Status: inactive or unreadable'
+    return 1
+}
+
 # 清除 UFW 状态快照
 invalidate_ufw_snapshot() {
     UFW_SNAPSHOT_READY=0
@@ -2734,13 +2791,10 @@ rollback_ufw_bootstrap() {
     verify_transaction_ufw_rules_absent "$batch_id" \
         || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" 'UFW 初始化规则残留'); }
     if (( result == 0 )); then
-        set_transaction_rollback_result "$batch_id" verified '' || true
-        set_transaction_phase "$batch_id" rolled_back
-        return 0
+        if complete_verified_rollback "$batch_id"; then return 0; fi
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入已验证回滚终态失败')
     fi
-    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
-    protect_failed_transaction "$batch_id" rollback_failed '无法验证 UFW 初始化回滚'
-    return 1
+    record_failed_rollback_and_protect "$batch_id" '无法验证 UFW 初始化回滚' "$rollback_errors"
 }
 
 enable_ufw_transaction() {
@@ -3118,6 +3172,12 @@ record_added_ufw_marker() {
 record_intended_ufw_marker() {
     local batch_id=$1 marker=$2
     printf '%s\n' "$marker" >> "${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
+    if (( $# == 8 )); then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$marker" "$3" "$4" "$5" "$6" "$7" "$8" \
+            >> "${BACKUP_DIR}/${batch_id}/ufw-intended-routes.tsv" || return 1
+        chmod 600 "${BACKUP_DIR}/${batch_id}/ufw-intended-routes.tsv" || return 1
+    fi
 }
 
 apply_ipv4_forwarding_for_transaction() {
@@ -3387,8 +3447,45 @@ render_expected_snat_rule() {
 }
 
 ufw_numbered_lines_for_marker() {
-    local marker=$1
-    ufw status numbered 2>/dev/null | awk -v marker="$marker" '$NF == marker {print}'
+    local marker=$1 numbered
+    if ! numbered=$(ufw status numbered 2>&1); then
+        return 1
+    fi
+    awk -v marker="$marker" '$NF == marker {print}' <<< "$numbered"
+}
+
+ufw_persistent_lines_for_marker() {
+    local marker=$1 added
+    if ! added=$(ufw show added 2>&1); then
+        return 1
+    fi
+    normalize_ufw_added_rule <<< "$added" | awk -v marker="$marker" '
+        {for (i = 1; i < NF; i++) if ($i == "comment" && $(i + 1) == marker) {print; break}}
+    '
+}
+
+ufw_persistent_marker_count() {
+    local marker=$1 lines
+    lines=$(ufw_persistent_lines_for_marker "$marker") || return 1
+    awk 'NF {count++} END {print count + 0}' <<< "$lines"
+}
+
+delete_recorded_persistent_ufw_route() {
+    local batch_id=$1 target_marker=$2
+    local definitions="${BACKUP_DIR}/${batch_id}/ufw-intended-routes.tsv"
+    local marker proto source in_if out_if landing_ip landing_port count found=0
+    [[ -f "$definitions" ]] || return 1
+    while IFS=$'\t' read -r marker proto source in_if out_if landing_ip landing_port; do
+        [[ "$marker" == "$target_marker" ]] || continue
+        found=1
+        count=$(ufw_persistent_marker_count "$marker") || return 1
+        while (( count > 0 )); do
+            ufw route delete allow in on "$in_if" out on "$out_if" proto "$proto" \
+                from "$source" to "$landing_ip" port "$landing_port" comment "$marker" || return 1
+            count=$(ufw_persistent_marker_count "$marker") || return 1
+        done
+    done < "$definitions"
+    (( found == 1 ))
 }
 
 verify_ufw_marker_effective() {
@@ -3882,28 +3979,36 @@ reconcile_all_live_managed_nat_to_file() {
 }
 
 remove_transaction_ufw_rules() {
-    local batch_id=$1 marker result=0 count
+    local batch_id=$1 marker result=0 count persistent_count
     local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
     [[ -f "$added_file" ]] || return 0
     while IFS= read -r marker; do
         [[ -n "$marker" ]] || continue
-        count=$(ufw_numbered_lines_for_marker "$marker" | awk 'NF {count++} END {print count + 0}') || { result=1; continue; }
+        count=$(ufw_numbered_lines_for_marker "$marker" \
+            | awk 'NF {count++} END {print count + 0}') || count=0
         if (( count == 1 )); then
             delete_ufw_rules_by_comment "$marker" || result=1
         elif (( count > 1 )); then
             result=1
+        fi
+        persistent_count=$(ufw_persistent_marker_count "$marker") || { result=1; continue; }
+        if (( persistent_count > 0 )); then
+            delete_recorded_persistent_ufw_route "$batch_id" "$marker" || result=1
         fi
     done < "$added_file"
     return "$result"
 }
 
 verify_transaction_ufw_rules_absent() {
-    local batch_id=$1 marker
+    local batch_id=$1 marker persistent_count runtime_lines
     local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
     [[ -f "$added_file" ]] || return 0
     while IFS= read -r marker; do
         [[ -n "$marker" ]] || continue
-        [[ -z $(ufw_numbered_lines_for_marker "$marker") ]] || return 1
+        runtime_lines=$(ufw_numbered_lines_for_marker "$marker") || return 1
+        [[ -z "$runtime_lines" ]] || return 1
+        persistent_count=$(ufw_persistent_marker_count "$marker") || return 1
+        (( persistent_count == 0 )) || return 1
     done < "$added_file"
     return 0
 }
@@ -3936,13 +4041,10 @@ rollback_created_forwarding() {
     verify_transaction_ufw_rules_absent "$batch_id" \
         || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务 UFW 规则仍有残留'); }
     if (( result == 0 )); then
-        set_transaction_rollback_result "$batch_id" verified '' || true
-        set_transaction_phase "$batch_id" rolled_back
-        return 0
+        if complete_verified_rollback "$batch_id"; then return 0; fi
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入已验证回滚终态失败')
     fi
-    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
-    protect_failed_transaction "$batch_id" rollback_failed '无法验证事务快照恢复'
-    return 1
+    record_failed_rollback_and_protect "$batch_id" '无法验证事务快照恢复' "$rollback_errors"
 }
 
 create_forwarding_transaction() {
@@ -3952,8 +4054,9 @@ create_forwarding_transaction() {
     local -a protocols=("$@")
     local proto marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
+    clear_verification_failure
     require_current_state_schema || return $?
-    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    require_active_ufw_for_forwarding || return "$RESULT_PRECHECK_FAILED"
     verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     begin_transaction "$batch_id" create "$(IFS=,; echo "${protocols[*]}")" || return "$RESULT_PRECHECK_FAILED"
@@ -3964,7 +4067,8 @@ create_forwarding_transaction() {
         && set_transaction_phase "$batch_id" applying_ufw; then
         for proto in "${protocols[@]}"; do
             marker=$(managed_marker "$batch_id" "$proto")
-            if ! record_intended_ufw_marker "$batch_id" "$marker" \
+            if ! record_intended_ufw_marker "$batch_id" "$marker" "$proto" "$source" \
+                "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                 || ! add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
                 "$landing_ip" "$landing_port" "$marker" \
                 || ! record_added_ufw_marker "$batch_id" "$marker"; then
@@ -4077,13 +4181,53 @@ verify_deleted_ufw_rules_restored() {
 }
 
 verify_forwarding_markers_absent() {
-    local marker live_nat
-    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
+    local marker proto live_nat live_raw persisted_lines state_count live_lines runtime_lines persistent_lines
+    if ! live_raw=$(iptables-save -t nat 2>&1); then
+        set_verification_failure verify_nat_live NAT_LIVE_READ_FAILED '' '' \
+            '无法读取运行时 NAT 规则' 'iptables-save -t nat succeeds' "$live_raw"
+        return 1
+    fi
+    live_nat=$(normalize_iptables_rule <<< "$live_raw")
     for marker in "$@"; do
-        grep -Fq -- "--comment ${marker}:" "$BEFORE_RULES" && return 1
-        [[ $(state_marker_count "$marker") == 0 ]] || return 1
-        grep -Fq -- "--comment ${marker}:" <<< "$live_nat" && return 1
-        [[ -z $(ufw_numbered_lines_for_marker "$marker") ]] || return 1
+        proto=${marker##*:}
+        persisted_lines=$(grep -F -- "--comment ${marker}:" "$BEFORE_RULES" 2>/dev/null || true)
+        if [[ -n "$persisted_lines" ]]; then
+            set_verification_failure verify_absence NAT_PERSISTED_RULE_REMAINS "$proto" "$marker" \
+                '删除后持久化 NAT 规则仍然存在' 'count=0' "$persisted_lines"
+            return 1
+        fi
+        state_count=$(state_marker_count "$marker")
+        if (( state_count > 0 )); then
+            set_verification_failure verify_absence STATE_MARKER_REMAINS "$proto" "$marker" \
+                '删除后状态登记仍然存在' 'count=0' "count=${state_count}"
+            return 1
+        fi
+        live_lines=$(grep -F -- "--comment ${marker}:" <<< "$live_nat" || true)
+        if [[ -n "$live_lines" ]]; then
+            set_verification_failure verify_absence NAT_LIVE_RULE_REMAINS "$proto" "$marker" \
+                '删除后运行时 NAT 规则仍然存在' 'count=0' "$live_lines"
+            return 1
+        fi
+        if ! runtime_lines=$(ufw_numbered_lines_for_marker "$marker"); then
+            set_verification_failure verify_absence UFW_RUNTIME_READ_FAILED "$proto" "$marker" \
+                '无法读取 UFW 运行时规则' 'ufw status numbered succeeds' 'command failed'
+            return 1
+        fi
+        if [[ -n "$runtime_lines" ]]; then
+            set_verification_failure verify_absence UFW_RUNTIME_MARKER_REMAINS "$proto" "$marker" \
+                '删除后 UFW 运行时规则仍然存在' 'count=0' "$runtime_lines"
+            return 1
+        fi
+        if ! persistent_lines=$(ufw_persistent_lines_for_marker "$marker"); then
+            set_verification_failure verify_absence UFW_READ_FAILED "$proto" "$marker" \
+                '无法读取 UFW 持久化规则' 'ufw show added succeeds' 'command failed'
+            return 1
+        fi
+        if [[ -n "$persistent_lines" ]]; then
+            set_verification_failure verify_absence UFW_PERSISTENT_MARKER_REMAINS "$proto" "$marker" \
+                '删除后 UFW 持久化规则仍然存在' 'count=0' "$persistent_lines"
+            return 1
+        fi
     done
     return 0
 }
@@ -4103,13 +4247,10 @@ rollback_deleted_forwarding() {
     verify_deleted_ufw_rules_restored "$batch_id" \
         || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '已删除 UFW 规则恢复验证失败'); }
     if (( result == 0 )); then
-        set_transaction_rollback_result "$batch_id" verified '' || true
-        set_transaction_phase "$batch_id" rolled_back
-        return 0
+        if complete_verified_rollback "$batch_id"; then return 0; fi
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入已验证回滚终态失败')
     fi
-    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
-    protect_failed_transaction "$batch_id" rollback_failed '无法验证删除事务恢复'
-    return 1
+    record_failed_rollback_and_protect "$batch_id" '无法验证删除事务恢复' "$rollback_errors"
 }
 
 delete_forwarding_transaction() {
@@ -4123,8 +4264,9 @@ delete_forwarding_transaction() {
     local -a markers=("$@")
     local marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK deleted=0
 
+    clear_verification_failure
     require_current_state_schema || return $?
-    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    require_active_ufw_for_forwarding || return "$RESULT_PRECHECK_FAILED"
     verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     (( ${#markers[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
@@ -4281,13 +4423,10 @@ rollback_replaced_forwarding() {
     verify_deleted_ufw_rules_restored "$batch_id" \
         || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '被覆盖 UFW 规则恢复验证失败'); }
     if (( result == 0 )); then
-        set_transaction_rollback_result "$batch_id" verified '' || true
-        set_transaction_phase "$batch_id" rolled_back
-        return 0
+        if complete_verified_rollback "$batch_id"; then return 0; fi
+        rollback_errors=$(append_rollback_error "$rollback_errors" '写入已验证回滚终态失败')
     fi
-    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
-    protect_failed_transaction "$batch_id" rollback_failed '无法验证覆盖事务恢复'
-    return 1
+    record_failed_rollback_and_protect "$batch_id" '无法验证覆盖事务恢复' "$rollback_errors"
 }
 
 replace_forwarding_transaction() {
@@ -4297,8 +4436,9 @@ replace_forwarding_transaction() {
     local -a protocols=("$@") old_markers=()
     local marker proto deleted=0 added=0 failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
+    clear_verification_failure
     require_current_state_schema || return $?
-    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    require_active_ufw_for_forwarding || return "$RESULT_PRECHECK_FAILED"
     verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     IFS=',' read -r -a old_markers <<< "$old_csv"
     (( ${#old_markers[@]} > 0 && ${#protocols[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
@@ -4325,7 +4465,8 @@ replace_forwarding_transaction() {
         if (( deleted == ${#old_markers[@]} )); then
             for proto in "${protocols[@]}"; do
                 marker=$(managed_marker "$batch_id" "$proto")
-                if record_intended_ufw_marker "$batch_id" "$marker" \
+                if record_intended_ufw_marker "$batch_id" "$marker" "$proto" "$source" \
+                    "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                     && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
                         "$landing_ip" "$landing_port" "$marker" \
                     && record_added_ufw_marker "$batch_id" "$marker"; then
