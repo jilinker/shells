@@ -74,6 +74,7 @@ VERIFY_FAILURE_EXPECTED=
 VERIFY_FAILURE_ACTUAL=
 VERIFY_FAILURE_AT=
 LAST_TRANSACTION_BATCH_ID=
+LAST_RESTORE_TRANSACTION_BATCH_ID=
 
 configure_state_paths() {
     STATE_FILE="${STATE_DIR}/forwarding.tsv"
@@ -1065,19 +1066,42 @@ restore_snapshot_transaction() {
     local target_batch=$1 restore_batch marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch
     local target="${BACKUP_DIR}/${target_batch}" target_state current_row result=0
     local delete_intent
-    [[ "$target_batch" =~ ^[A-Za-z0-9._-]+$ && -d "$target" && ! -L "$target" ]] \
-        || return "$RESULT_PRECHECK_FAILED"
-    [[ $(classify_snapshot "$target_batch") == success ]] || return "$RESULT_PRECHECK_FAILED"
-    [[ -f "$target/before.rules" && -f "$target/forwarding.tsv" && -f "$target/ip-forwarding.tsv" ]] \
-        || return "$RESULT_PRECHECK_FAILED"
+    clear_verification_failure
+    LAST_RESTORE_TRANSACTION_BATCH_ID=
+    if [[ ! "$target_batch" =~ ^[A-Za-z0-9._-]+$ || ! -d "$target" || -L "$target" ]]; then
+        set_verification_failure restore_preflight RESTORE_TARGET_INVALID '' '' \
+            '备份 ID 无效或目标目录不存在' 'existing non-symlink backup directory' "$target_batch"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if [[ $(classify_snapshot "$target_batch") != success ]]; then
+        set_verification_failure restore_preflight RESTORE_SNAPSHOT_NOT_SUCCESS '' '' \
+            '只有已验证成功的快照可以恢复' 'snapshot status=success' \
+            "snapshot status=$(classify_snapshot "$target_batch")"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if [[ ! -f "$target/before.rules" || ! -f "$target/forwarding.tsv" || ! -f "$target/ip-forwarding.tsv" ]]; then
+        set_verification_failure restore_preflight RESTORE_SNAPSHOT_INCOMPLETE '' '' \
+            '备份缺少恢复所需文件' 'before.rules, forwarding.tsv, ip-forwarding.tsv' "$target"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
     target_state="$target/forwarding.tsv"
     if [[ -s "$target_state" ]]; then
-        [[ -f "$target/state.version" && $(cat "$target/state.version") == "$STATE_SCHEMA_VERSION" ]] \
-            || return "$RESULT_REPAIR_REQUIRED"
+        if [[ ! -f "$target/state.version" || $(cat "$target/state.version") != "$STATE_SCHEMA_VERSION" ]]; then
+            set_verification_failure restore_preflight RESTORE_STATE_SCHEMA_INVALID '' '' \
+                '备份中的非空转发状态 schema 不受支持' \
+                "state.version=${STATE_SCHEMA_VERSION}" \
+                "state.version=$(cat "$target/state.version" 2>/dev/null || printf absent)"
+            return "$RESULT_REPAIR_REQUIRED"
+        fi
     fi
 
     restore_batch="restore-$(new_batch_id)"
-    begin_transaction "$restore_batch" restore "$target_batch" || return "$RESULT_PRECHECK_FAILED"
+    if ! begin_transaction "$restore_batch" restore "$target_batch"; then
+        set_verification_failure restore_preflight RESTORE_TRANSACTION_BEGIN_FAILED '' '' \
+            '无法创建备份恢复事务' 'transaction journal and snapshot created' "$restore_batch"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    LAST_RESTORE_TRANSACTION_BATCH_ID=$restore_batch
     delete_intent="${BACKUP_DIR}/${restore_batch}/ufw-delete-intended.tsv"
     if ! install -m 600 /dev/null "$delete_intent"; then
         rollback_replaced_forwarding "$restore_batch" \
@@ -1157,6 +1181,7 @@ failure_stage_label() {
         verify_nat_file) printf 'NAT 规则集合验证' ;;
         verify_absence) printf '删除后残留验证' ;;
         recovery) printf '启动事务恢复' ;;
+        restore_preflight) printf '备份恢复前置检查' ;;
         applying_ipv4) printf '应用 IPv4 转发' ;;
         applying_nat) printf '应用 NAT 配置' ;;
         applying_ufw) printf '应用 UFW 配置' ;;
@@ -2816,6 +2841,7 @@ enable_ufw_transaction() {
         for port in "${ssh_ports[@]}"; do
             marker=$(managed_marker "$batch_id" "ssh-${port}")
             if record_intended_ufw_marker "$batch_id" "$marker" \
+                && record_intended_ufw_inbound_rule "$batch_id" "$marker" tcp any any "$port" \
                 && add_inbound_allow_rule "$port" tcp "$marker" \
                 && record_added_ufw_marker "$batch_id" "$marker"; then
                 :
@@ -3180,6 +3206,14 @@ record_intended_ufw_marker() {
     fi
 }
 
+record_intended_ufw_inbound_rule() {
+    local batch_id=$1 marker=$2 proto=$3 source=$4 destination=$5 port=$6
+    local target="${BACKUP_DIR}/${batch_id}/ufw-intended-inbound.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$marker" "$proto" "$source" "$destination" "$port" >> "$target" || return 1
+    chmod 600 "$target"
+}
+
 apply_ipv4_forwarding_for_transaction() {
     local batch_id=$1 runtime persistent owned_runtime=no owned_persistent=no
     runtime=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || return 1
@@ -3486,6 +3520,37 @@ delete_recorded_persistent_ufw_route() {
         done
     done < "$definitions"
     (( found == 1 ))
+}
+
+delete_recorded_persistent_ufw_inbound() {
+    local batch_id=$1 target_marker=$2
+    local definitions="${BACKUP_DIR}/${batch_id}/ufw-intended-inbound.tsv"
+    local marker proto source destination port count found=0
+    [[ -f "$definitions" ]] || return 1
+    while IFS=$'\t' read -r marker proto source destination port; do
+        [[ "$marker" == "$target_marker" ]] || continue
+        found=1
+        count=$(ufw_persistent_marker_count "$marker") || return 1
+        while (( count > 0 )); do
+            ufw delete allow in proto "$proto" from "$source" to "$destination" \
+                port "$port" comment "$marker" || return 1
+            count=$(ufw_persistent_marker_count "$marker") || return 1
+        done
+    done < "$definitions"
+    (( found == 1 ))
+}
+
+delete_recorded_persistent_ufw_rule() {
+    local batch_id=$1 marker=$2
+    local route_file="${BACKUP_DIR}/${batch_id}/ufw-intended-routes.tsv"
+    local inbound_file="${BACKUP_DIR}/${batch_id}/ufw-intended-inbound.tsv"
+    if [[ -f "$route_file" ]] && awk -F '\t' -v marker="$marker" '$1 == marker {found=1} END {exit found ? 0 : 1}' "$route_file"; then
+        delete_recorded_persistent_ufw_route "$batch_id" "$marker"
+    elif [[ -f "$inbound_file" ]] && awk -F '\t' -v marker="$marker" '$1 == marker {found=1} END {exit found ? 0 : 1}' "$inbound_file"; then
+        delete_recorded_persistent_ufw_inbound "$batch_id" "$marker"
+    else
+        return 1
+    fi
 }
 
 verify_ufw_marker_effective() {
@@ -3993,7 +4058,7 @@ remove_transaction_ufw_rules() {
         fi
         persistent_count=$(ufw_persistent_marker_count "$marker") || { result=1; continue; }
         if (( persistent_count > 0 )); then
-            delete_recorded_persistent_ufw_route "$batch_id" "$marker" || result=1
+            delete_recorded_persistent_ufw_rule "$batch_id" "$marker" || result=1
         fi
     done < "$added_file"
     return "$result"
@@ -5063,7 +5128,7 @@ transaction_maintenance_menu() {
                 else
                     result=$?
                     error "$(result_message "$result")"
-                    show_transaction_failure_for_result "$result" "$LAST_TRANSACTION_BATCH_ID"
+                    show_transaction_failure_for_result "$result" "$LAST_RESTORE_TRANSACTION_BATCH_ID"
                 fi
                 end_mutation
                 ;;

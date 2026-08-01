@@ -298,7 +298,7 @@ UFW_ACTIVE=1
 LIVE_NAT_FILE="$TEST_TMP/live-nat.rules"
 cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 ufw() {
-    local previous= argument number index
+    local previous= argument number index port
     case "$*" in
         'status')
             if (( UFW_ACTIVE == 1 )); then printf 'Status: active\n'; else printf 'Status: inactive\n'; fi
@@ -1001,18 +1001,19 @@ ufw() {
             printf 'Default: deny (incoming), allow (outgoing), deny (routed)\n'
             ;;
         'show added')
-            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then
+            if [[ ${BOOT_UFW_MARKERS[0]+set} == set ]]; then
                 for argument in "${BOOT_UFW_MARKERS[@]}"; do
                     if [[ "$argument" == ufw-relay:* || "$argument" == lsec:*:legacy-* ]]; then
                         printf "ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.2 port 80 comment '%s'\n" "$argument"
                     else
-                        printf "ufw allow in proto tcp from any to any port 2222 comment '%s'\n" "$argument"
+                        port=${argument##*-}
+                        printf "ufw allow in proto tcp from any to any port %s comment '%s'\n" "$port" "$argument"
                     fi
                 done
             fi
             ;;
         'status numbered')
-            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then
+            if [[ "$BOOT_UFW_ACTIVE" == yes && ${BOOT_UFW_MARKERS[0]+set} == set ]]; then
                 for (( index=0; index<${#BOOT_UFW_MARKERS[@]}; index++ )); do
                     if [[ "${BOOT_UFW_MARKERS[$index]}" == ufw-relay:* || "${BOOT_UFW_MARKERS[$index]}" == lsec:*:legacy-* ]]; then
                         printf '[ %d] 10.0.0.2 80/tcp on eth1 ALLOW FWD Anywhere on eth0 # %s\n' \
@@ -1033,6 +1034,25 @@ ufw() {
                 unset 'BOOT_UFW_MARKERS[index]'
                 BOOT_UFW_MARKERS=("${BOOT_UFW_MARKERS[@]}")
             fi
+            ;;
+        'delete allow in '*)
+            previous=
+            for argument in "$@"; do
+                if [[ "$previous" == comment ]]; then
+                    for (( index=0; index<${#BOOT_UFW_MARKERS[@]}; index++ )); do
+                        [[ "${BOOT_UFW_MARKERS[$index]}" == "$argument" ]] || continue
+                        if (( ${#BOOT_UFW_MARKERS[@]} == 1 )); then
+                            BOOT_UFW_MARKERS=()
+                        else
+                            unset 'BOOT_UFW_MARKERS[index]'
+                            BOOT_UFW_MARKERS=("${BOOT_UFW_MARKERS[@]}")
+                        fi
+                        return 0
+                    done
+                fi
+                previous=$argument
+            done
+            return 1
             ;;
         *)
             for argument in "$@"; do
@@ -1065,6 +1085,7 @@ assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified UFW rollback created protected lock'
 assert_file_contains "$TRANSACTION_DIR/ufw-failure.txn" $'rollback_status\tverified'
 assert_file_contains "$BACKUP_DIR/ufw-failure/failure/verification.tsv" $'operation\tenable_ufw'
+assert_contains "$(cat "$BOOT_UFW_LOG")" 'delete allow in proto tcp from any to any port 2222 comment lsec:ufw-failure:ssh-2222'
 BOOT_UFW_FAIL=
 eval "$original_confirm_ufw_activation"
 BOOT_UFW_MARKERS=('lsec:preview:ssh-2222')
@@ -1120,6 +1141,7 @@ printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
     '-A PREROUTING -i eth0 -p tcp --dport 80 -m comment --comment ufw-relay:legacy-id:dnat -j DNAT --to-destination 10.0.0.2:80' \
     '-A POSTROUTING -o eth1 -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-id:snat -j MASQUERADE' \
     'COMMIT' > "$BEFORE_RULES"
+BOOT_UFW_ACTIVE=yes
 BOOT_UFW_MARKERS=('ufw-relay:legacy-id')
 assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-exact'
 sed -i.bak 's/-i eth0/-i eth9/' "$BEFORE_RULES"
@@ -1236,6 +1258,14 @@ UFW_SYSCTL_FILE="$TEST_TMP/restore-sysctl.conf"
 printf 'restore-point\n' > "$BEFORE_RULES"
 printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"
 : > "$STATE_FILE"
+LAST_TRANSACTION_BATCH_ID=unrelated-old-batch
+set_verification_failure verifying STALE_FAILURE tcp lsec:stale:tcp stale stale stale
+assert_status "$RESULT_PRECHECK_FAILED" restore_snapshot_transaction does-not-exist
+assert_eq "$LAST_RESTORE_TRANSACTION_BATCH_ID" ''
+assert_eq "$VERIFY_FAILURE_CODE" RESTORE_TARGET_INVALID
+restore_preflight_details=$(show_transaction_failure_for_result "$RESULT_PRECHECK_FAILED" "$LAST_RESTORE_TRANSACTION_BATCH_ID" 2>&1)
+assert_contains "$restore_preflight_details" '失败代码：RESTORE_TARGET_INVALID'
+assert_not_contains "$restore_preflight_details" 'STALE_FAILURE'
 begin_transaction restore-source create none
 set_transaction_phase restore-source verified
 finish_transaction restore-source committed
