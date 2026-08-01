@@ -15,6 +15,14 @@ assert_eq "$RESULT_PROTECTED_LOCKOUT" 60
 assert_eq "$RESULT_REPAIR_REQUIRED" 70
 assert_eq "$(result_message "$RESULT_CANCELLED")" "操作已取消，未执行任何变更"
 
+clear_verification_failure
+set_verification_failure verify_ufw_persistent UFW_ROUTE_MISSING tcp \
+    lsec:failure:tcp 'UFW 持久化路由缺失' \
+    'in=eth0 out=eth1 proto=tcp source=any dst=10.0.0.2 port=52350' $'count=0\tunexpected\nline'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_ROUTE_MISSING
+assert_eq "$VERIFY_FAILURE_PROTOCOL" tcp
+assert_eq "$VERIFY_FAILURE_ACTUAL" 'count=0 unexpected line'
+
 TEST_TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_TMP"' EXIT
 
@@ -82,7 +90,25 @@ for snapshot_file in before.rules forwarding.tsv metadata.tsv ip-forwarding.tsv;
     [[ -f "$snapshot_dir/$snapshot_file" ]] || fail "missing snapshot: $snapshot_file"
 done
 assert_eq "$(file_mode "$journal_file")" 600
+assert_file_contains "$journal_file" $'schema\t3'
 assert_file_contains "$journal_file" $'phase\tprepared'
+
+clear_verification_failure
+set_verification_failure verify_ufw_persistent UFW_ROUTE_MISSING tcp \
+    lsec:journal:tcp 'UFW 持久化路由缺失' 'expected route' 'actual route'
+record_transaction_failure "$batch_id"
+set_transaction_rollback_result "$batch_id" verified ''
+set_transaction_evidence_error "$batch_id" 'iptables-save evidence unavailable'
+assert_file_contains "$journal_file" $'failure_code\tUFW_ROUTE_MISSING'
+assert_file_contains "$journal_file" $'failure_summary\tUFW 持久化路由缺失'
+assert_file_contains "$journal_file" $'rollback_status\tverified'
+assert_file_contains "$journal_file" $'evidence_error\tiptables-save evidence unavailable'
+
+set_verification_failure verify_nat_persistent NAT_RULE_MISSING udp \
+    lsec:journal:udp '不得覆盖首个根因' expected actual
+record_transaction_failure "$batch_id"
+assert_file_contains "$journal_file" $'failure_code\tUFW_ROUTE_MISSING'
+assert_not_contains "$(cat "$journal_file")" '不得覆盖首个根因'
 
 for phase in applying_nat applying_ufw committing_state verifying; do
     set_transaction_phase "$batch_id" "$phase"
@@ -881,6 +907,11 @@ printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"
 begin_transaction recovery-batch create tcp
 printf 'mutated\n' > "$BEFORE_RULES"
 set_transaction_phase recovery-batch applying_nat
+# schema 2 日志没有结构化诊断字段，仍必须可以恢复。
+sed -i.bak -e $'s/^schema\t3$/schema\t2/' \
+    -e '/^failure_/d' -e '/^rollback_/d' -e '/^evidence_error/d' \
+    "$TRANSACTION_DIR/recovery-batch.txn"
+rm -f "$TRANSACTION_DIR/recovery-batch.txn.bak"
 assert_eq "$(scan_incomplete_transactions)" recovery-batch
 recover_transaction recovery-batch >/dev/null
 assert_eq "$(cat "$BEFORE_RULES")" original

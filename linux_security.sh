@@ -60,10 +60,19 @@ readonly RESULT_PROTECTED_LOCKOUT=60
 readonly RESULT_REPAIR_REQUIRED=70
 readonly MUTATION_LOCK_FD=9
 readonly STATE_SCHEMA_VERSION=2
+readonly TRANSACTION_SCHEMA_VERSION=3
 MUTATION_LOCK_HELD=0
 MISSING_DEPENDENCIES=()
 readonly FORWARD_DEPENDENCIES='flock ufw iptables iptables-save iptables-restore sysctl'
 readonly UFW_RISK_CONFIRMATION='我确认SSH端口已放行并承担断连风险'
+VERIFY_FAILURE_STAGE=
+VERIFY_FAILURE_CODE=
+VERIFY_FAILURE_PROTOCOL=
+VERIFY_FAILURE_MARKER=
+VERIFY_FAILURE_SUMMARY=
+VERIFY_FAILURE_EXPECTED=
+VERIFY_FAILURE_ACTUAL=
+VERIFY_FAILURE_AT=
 
 configure_state_paths() {
     STATE_FILE="${STATE_DIR}/forwarding.tsv"
@@ -96,6 +105,46 @@ result_message() {
         70) printf '%s' '发现旧状态或漂移，必须先修复' ;;
         *)  printf '%s' '未知结果' ;;
     esac
+}
+
+# 事务诊断字段必须保持单行 TSV；保留原始含义，但消除控制字符和重复空白。
+sanitize_transaction_value() {
+    local value=${1:-}
+    value=${value//$'\t'/ }
+    value=${value//$'\r'/ }
+    value=${value//$'\n'/ }
+    while [[ "$value" == *'  '* ]]; do
+        value=${value//'  '/' '}
+    done
+    value=${value# }
+    value=${value% }
+    printf '%s' "$value"
+}
+
+clear_verification_failure() {
+    VERIFY_FAILURE_STAGE=
+    VERIFY_FAILURE_CODE=
+    VERIFY_FAILURE_PROTOCOL=
+    VERIFY_FAILURE_MARKER=
+    VERIFY_FAILURE_SUMMARY=
+    VERIFY_FAILURE_EXPECTED=
+    VERIFY_FAILURE_ACTUAL=
+    VERIFY_FAILURE_AT=
+}
+
+set_verification_failure() {
+    VERIFY_FAILURE_STAGE=$(sanitize_transaction_value "${1:-}")
+    VERIFY_FAILURE_CODE=$(sanitize_transaction_value "${2:-}")
+    VERIFY_FAILURE_PROTOCOL=$(sanitize_transaction_value "${3:-}")
+    VERIFY_FAILURE_MARKER=$(sanitize_transaction_value "${4:-}")
+    VERIFY_FAILURE_SUMMARY=$(sanitize_transaction_value "${5:-}")
+    VERIFY_FAILURE_EXPECTED=$(sanitize_transaction_value "${6:-}")
+    VERIFY_FAILURE_ACTUAL=$(sanitize_transaction_value "${7:-}")
+    VERIFY_FAILURE_AT=$(date -u +%FT%TZ)
+}
+
+verification_failure_present() {
+    [[ -n "$VERIFY_FAILURE_CODE" ]]
 }
 
 normalize_result_code() {
@@ -575,7 +624,7 @@ new_batch_id() {
 
 write_transaction_record() {
     local batch_id=$1 operation=$2 phase=$3 snapshot=$4 rule_ids=$5 last_error=${6:-}
-    printf 'schema\t%s\n' "$STATE_SCHEMA_VERSION"
+    printf 'schema\t%s\n' "$TRANSACTION_SCHEMA_VERSION"
     printf 'batch_id\t%s\n' "$batch_id"
     printf 'operation\t%s\n' "$operation"
     printf 'phase\t%s\n' "$phase"
@@ -584,6 +633,17 @@ write_transaction_record() {
     printf 'snapshot\t%s\n' "$snapshot"
     printf 'rule_ids\t%s\n' "$rule_ids"
     printf 'last_error\t%s\n' "$last_error"
+    printf 'failure_stage\t\n'
+    printf 'failure_code\t\n'
+    printf 'failure_protocol\t\n'
+    printf 'failure_marker\t\n'
+    printf 'failure_summary\t\n'
+    printf 'failure_expected\t\n'
+    printf 'failure_actual\t\n'
+    printf 'failure_at\t\n'
+    printf 'rollback_status\t\n'
+    printf 'rollback_error\t\n'
+    printf 'evidence_error\t\n'
 }
 
 snapshot_metadata() {
@@ -642,6 +702,72 @@ begin_transaction() {
 transaction_value() {
     local journal=$1 key=$2
     awk -F '\t' -v key="$key" '$1 == key {sub(/^[^\t]*\t/, ""); print; exit}' "$journal"
+}
+
+render_transaction_failure() {
+    local journal=$1
+    awk -F '\t' -v OFS='\t' \
+        -v failure_stage="$VERIFY_FAILURE_STAGE" \
+        -v failure_code="$VERIFY_FAILURE_CODE" \
+        -v failure_protocol="$VERIFY_FAILURE_PROTOCOL" \
+        -v failure_marker="$VERIFY_FAILURE_MARKER" \
+        -v failure_summary="$VERIFY_FAILURE_SUMMARY" \
+        -v failure_expected="$VERIFY_FAILURE_EXPECTED" \
+        -v failure_actual="$VERIFY_FAILURE_ACTUAL" \
+        -v failure_at="$VERIFY_FAILURE_AT" '
+        $1 == "failure_stage" {print $1, failure_stage; next}
+        $1 == "failure_code" {print $1, failure_code; next}
+        $1 == "failure_protocol" {print $1, failure_protocol; next}
+        $1 == "failure_marker" {print $1, failure_marker; next}
+        $1 == "failure_summary" {print $1, failure_summary; next}
+        $1 == "failure_expected" {print $1, failure_expected; next}
+        $1 == "failure_actual" {print $1, failure_actual; next}
+        $1 == "failure_at" {print $1, failure_at; next}
+        {print}
+    ' "$journal"
+}
+
+record_transaction_failure() {
+    local batch_id=$1 journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 1
+    verification_failure_present || return 1
+    # 首个失败是事务根因；回滚或诊断阶段不得覆盖。
+    [[ -z $(transaction_value "$journal" failure_code) ]] || return 0
+    atomic_write "$journal" render_transaction_failure "$journal"
+}
+
+render_transaction_rollback_result() {
+    local journal=$1 status=$2 detail=${3:-}
+    awk -F '\t' -v OFS='\t' -v status="$status" -v detail="$detail" '
+        $1 == "rollback_status" {print $1, status; next}
+        $1 == "rollback_error" {print $1, detail; next}
+        {print}
+    ' "$journal"
+}
+
+set_transaction_rollback_result() {
+    local batch_id=$1 status=$2 detail=${3:-}
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 1
+    status=$(sanitize_transaction_value "$status")
+    detail=$(sanitize_transaction_value "$detail")
+    atomic_write "$journal" render_transaction_rollback_result "$journal" "$status" "$detail"
+}
+
+render_transaction_evidence_error() {
+    local journal=$1 detail=${2:-}
+    awk -F '\t' -v OFS='\t' -v detail="$detail" '
+        $1 == "evidence_error" {print $1, detail; next}
+        {print}
+    ' "$journal"
+}
+
+set_transaction_evidence_error() {
+    local batch_id=$1 detail=${2:-}
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 1
+    detail=$(sanitize_transaction_value "$detail")
+    atomic_write "$journal" render_transaction_evidence_error "$journal" "$detail"
 }
 
 render_transaction_phase() {
