@@ -43,11 +43,35 @@ SECURITY_PASS_COUNT=0
 SECURITY_WARNING_COUNT=0
 SECURITY_UNKNOWN_COUNT=0
 
+readonly RESULT_OK=0
+readonly RESULT_CANCELLED=10
+readonly RESULT_PRECHECK_FAILED=20
+readonly RESULT_APPLY_FAILED_ROLLED_BACK=30
+readonly RESULT_ROLLBACK_FAILED=40
+readonly RESULT_VERIFY_FAILED_ROLLED_BACK=50
+readonly RESULT_PROTECTED_LOCKOUT=60
+readonly RESULT_REPAIR_REQUIRED=70
+
 info()  { printf "%b[信息]%b %s\n" "$BLUE" "$NC" "$*"; }
 ok()    { printf "%b[成功]%b %s\n" "$GREEN" "$NC" "$*"; }
 warn()  { printf "%b[警告]%b %s\n" "$YELLOW" "$NC" "$*"; }
 error() { printf "%b[错误]%b %s\n" "$RED" "$NC" "$*" >&2; }
 die()   { error "$*"; exit 1; }
+
+# 将内部结果转换为准确且稳定的用户提示。
+result_message() {
+    case ${1:-} in
+        0)  printf '%s' '操作成功且已完成本机验证' ;;
+        10) printf '%s' '操作已取消，未执行任何变更' ;;
+        20) printf '%s' '前置检查失败，未执行任何变更' ;;
+        30) printf '%s' '应用失败，已验证回滚' ;;
+        40) printf '%s' '回滚失败，已进入保护锁定' ;;
+        50) printf '%s' '应用后验证失败，已验证回滚' ;;
+        60) printf '%s' '当前处于保护锁定，仅允许诊断与恢复' ;;
+        70) printf '%s' '发现旧状态或漂移，必须先修复' ;;
+        *)  printf '%s' '未知结果' ;;
+    esac
+}
 
 # 记录安全检查结果
 record_security_check() {
@@ -2350,6 +2374,6 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${LSEC_SOURCE_ONLY:-0}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi

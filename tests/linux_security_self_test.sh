@@ -7,7 +7,7 @@ TEST_TMP=$(mktemp -d)
 trap 'rm -rf -- "$TEST_TMP"' EXIT
 
 # shellcheck source=../linux_security.sh
-source "$ROOT_DIR/linux_security.sh"
+LSEC_SOURCE_ONLY=1 source "$ROOT_DIR/linux_security.sh"
 
 remote_url='https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh'
 grep -Fq "$remote_url" "$ROOT_DIR/README.md"
