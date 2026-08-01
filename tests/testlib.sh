@@ -24,6 +24,11 @@ assert_contains() {
     [[ "$actual" == *"$expected"* ]] || fail "text lacks: $expected"
 }
 
+assert_not_contains() {
+    local actual=$1 unexpected=$2
+    [[ "$actual" != *"$unexpected"* ]] || fail "text unexpectedly contains: $unexpected"
+}
+
 assert_status() {
     local expected=$1 actual
     shift

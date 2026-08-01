@@ -222,6 +222,11 @@ snapshot_current_state() {
     snapshot_copy_or_empty "$BEFORE_RULES" "$snapshot/before.rules" || return 1
     snapshot_copy_or_empty "$STATE_FILE" "$snapshot/forwarding.tsv" || return 1
     snapshot_copy_or_empty "$IP_FORWARDING_STATE" "$snapshot/ip-forwarding.tsv" || return 1
+    if [[ -f "$STATE_VERSION_FILE" ]]; then
+        install -m 600 "$STATE_VERSION_FILE" "$snapshot/state.version" || return 1
+    else
+        install -m 600 /dev/null "$snapshot/state.version.absent" || return 1
+    fi
     atomic_write "$snapshot/metadata.tsv" snapshot_metadata "$batch_id" "$operation"
 }
 
@@ -1414,10 +1419,18 @@ install_ufw_if_needed() {
 }
 
 init_state() {
-    install -d -m 700 "$STATE_DIR"
-    touch "$STATE_FILE"
-    chmod 600 "$STATE_FILE"
-    [[ -f "$BEFORE_RULES" ]] || die "未找到 ${BEFORE_RULES}，请检查 UFW 安装状态"
+    if ! install -d -m 700 "$STATE_DIR"; then
+        error "无法创建状态目录：${STATE_DIR}"
+        return 1
+    fi
+    if ! touch "$STATE_FILE" || ! chmod 600 "$STATE_FILE"; then
+        error "无法初始化状态文件：${STATE_FILE}"
+        return 1
+    fi
+    if [[ ! -f "$BEFORE_RULES" ]]; then
+        error "未找到 ${BEFORE_RULES}，请检查 UFW 安装状态"
+        return 1
+    fi
 }
 
 validate_port() {
@@ -1809,6 +1822,251 @@ ensure_nat_managed_section() {
     rm -f "$tmp" "$tmp2"
 }
 
+# 在临时副本中生成整个转发批次，不修改正在使用的 before.rules。
+stage_forward_nat() {
+    local staged=$1 batch_id=$2 source=$3 in_if=$4 public_port=$5
+    local out_if=$6 landing_ip=$7 landing_port=$8 masquerade=$9
+    shift 9
+    local proto marker source_match dnat_line snat_line
+    local original_before_rules=$BEFORE_RULES result=0
+
+    validate_address_token_or_any "$source" || return 1
+    validate_interface_name "$in_if" || return 1
+    validate_interface_name "$out_if" || return 1
+    validate_port "$public_port" || return 1
+    validate_ipv4 "$landing_ip" || return 1
+    validate_port "$landing_port" || return 1
+    [[ "$masquerade" == yes || "$masquerade" == no ]] || return 1
+    (( $# > 0 )) || return 1
+
+    cp -a "$BEFORE_RULES" "$staged" || return 1
+    BEFORE_RULES=$staged
+    if ! ensure_nat_managed_section; then
+        result=1
+    fi
+
+    source_match=
+    [[ "$source" != any ]] && source_match="-s ${source}"
+    if (( result == 0 )); then
+        for proto in "$@"; do
+            if [[ "$proto" != tcp && "$proto" != udp ]]; then
+                result=1
+                break
+            fi
+            marker=$(managed_marker "$batch_id" "$proto")
+            validate_managed_marker "$marker" || { result=1; break; }
+            dnat_line="-A PREROUTING -i ${in_if} -p ${proto} ${source_match} --dport ${public_port} -m comment --comment ${marker}:dnat -j DNAT --to-destination ${landing_ip}:${landing_port}"
+            insert_nat_rule_line "$dnat_line" || { result=1; break; }
+            if [[ "$masquerade" == yes ]]; then
+                snat_line="-A POSTROUTING -o ${out_if} -p ${proto} -d ${landing_ip} --dport ${landing_port} -m comment --comment ${marker}:snat -j MASQUERADE"
+                insert_nat_rule_line "$snat_line" || { result=1; break; }
+            fi
+        done
+    fi
+    BEFORE_RULES=$original_before_rules
+    return "$result"
+}
+
+validate_staged_nat() {
+    local staged=$1
+    [[ -s "$staged" ]] || return 1
+    iptables-restore --test < "$staged"
+}
+
+apply_staged_nat_file() {
+    local staged=$1
+    install -m 640 "$staged" "$BEFORE_RULES"
+}
+
+add_forward_ufw_route() {
+    local proto=$1 source=$2 in_if=$3 out_if=$4 landing_ip=$5 landing_port=$6 marker=$7
+    ufw route allow in on "$in_if" out on "$out_if" proto "$proto" \
+        from "$source" to "$landing_ip" port "$landing_port" comment "$marker"
+}
+
+render_state_with_forward_batch() {
+    local current_state=$1 batch_id=$2 source=$3 in_if=$4 public_port=$5
+    local out_if=$6 landing_ip=$7 landing_port=$8 masquerade=$9
+    shift 9
+    local proto marker
+
+    [[ -f "$current_state" ]] && cat "$current_state"
+    for proto in "$@"; do
+        marker=$(managed_marker "$batch_id" "$proto")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
+            "$landing_ip" "$landing_port" "$masquerade" "$batch_id"
+    done
+}
+
+write_state_schema_version() {
+    printf '%s\n' "$STATE_SCHEMA_VERSION"
+}
+
+commit_forward_state() {
+    local batch_id=$1 source=$2 in_if=$3 public_port=$4 out_if=$5
+    local landing_ip=$6 landing_port=$7 masquerade=$8
+    shift 8
+    atomic_write "$STATE_FILE" render_state_with_forward_batch "$STATE_FILE" \
+        "$batch_id" "$source" "$in_if" "$public_port" "$out_if" \
+        "$landing_ip" "$landing_port" "$masquerade" "$@" || return 1
+    atomic_write "$STATE_VERSION_FILE" write_state_schema_version
+}
+
+record_added_ufw_marker() {
+    local batch_id=$1 marker=$2
+    printf '%s\n' "$marker" >> "${BACKUP_DIR}/${batch_id}/ufw-added.txt"
+}
+
+record_intended_ufw_marker() {
+    local batch_id=$1 marker=$2
+    printf '%s\n' "$marker" >> "${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
+}
+
+apply_ipv4_forwarding_for_transaction() {
+    local batch_id=$1
+    if [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]]; then
+        return 0
+    fi
+    ensure_ipv4_forwarding || return 1
+    printf 'owner_batch\t%s\nowned\tyes\n' "$batch_id" > "$IP_FORWARDING_STATE"
+}
+
+verify_forwarding_batch() {
+    local batch_id=$1
+    shift
+    local proto marker ufw_status
+    ufw_status=$(ufw status numbered 2>/dev/null) || return 1
+    for proto in "$@"; do
+        marker=$(managed_marker "$batch_id" "$proto")
+        grep -Fq -- "--comment ${marker}:dnat" "$BEFORE_RULES" || return 1
+        state_has_unique_marker "$marker" || return 1
+        grep -Fq -- "$marker" <<< "$ufw_status" || return 1
+    done
+}
+
+restore_transaction_snapshot() {
+    local batch_id=$1 snapshot="${BACKUP_DIR}/${batch_id}"
+    install -m 640 "$snapshot/before.rules" "$BEFORE_RULES" || return 1
+    install -m 600 "$snapshot/forwarding.tsv" "$STATE_FILE" || return 1
+    install -m 600 "$snapshot/ip-forwarding.tsv" "$IP_FORWARDING_STATE" || return 1
+    if [[ -f "$snapshot/state.version.absent" ]]; then
+        rm -f -- "$STATE_VERSION_FILE" || return 1
+    else
+        install -m 600 "$snapshot/state.version" "$STATE_VERSION_FILE" || return 1
+    fi
+    reload_ufw
+}
+
+verify_snapshot_restored() {
+    local batch_id=$1 snapshot="${BACKUP_DIR}/${batch_id}"
+    cmp -s "$snapshot/before.rules" "$BEFORE_RULES" || return 1
+    cmp -s "$snapshot/forwarding.tsv" "$STATE_FILE" || return 1
+    cmp -s "$snapshot/ip-forwarding.tsv" "$IP_FORWARDING_STATE" || return 1
+    if [[ -f "$snapshot/state.version.absent" ]]; then
+        [[ ! -e "$STATE_VERSION_FILE" ]]
+    else
+        cmp -s "$snapshot/state.version" "$STATE_VERSION_FILE"
+    fi
+}
+
+remove_transaction_ufw_rules() {
+    local batch_id=$1 marker result=0
+    local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
+    [[ -f "$added_file" ]] || return 0
+    while IFS= read -r marker; do
+        [[ -n "$marker" ]] || continue
+        delete_ufw_rules_by_comment "$marker" || result=1
+    done < "$added_file"
+    return "$result"
+}
+
+verify_transaction_ufw_rules_absent() {
+    local batch_id=$1 marker status
+    local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
+    [[ -f "$added_file" ]] || return 0
+    status=$(ufw status numbered 2>/dev/null) || return 1
+    while IFS= read -r marker; do
+        [[ -n "$marker" ]] || continue
+        grep -Fq -- "$marker" <<< "$status" && return 1
+    done < "$added_file"
+    return 0
+}
+
+write_protected_record() {
+    local batch_id=$1 phase=$2 reason=$3
+    printf 'batch_id\t%s\nphase\t%s\nreason\t%s\ncreated_at\t%s\n' \
+        "$batch_id" "$phase" "$reason" "$(date -u +%FT%TZ)"
+}
+
+protect_failed_transaction() {
+    local batch_id=$1 phase=$2 reason=$3
+    atomic_write "$PROTECTED_LOCK" write_protected_record "$batch_id" "$phase" "$reason" || return 1
+    set_transaction_phase "$batch_id" protected "$reason" || true
+}
+
+rollback_created_forwarding() {
+    local batch_id=$1
+    local result=0
+    remove_transaction_ufw_rules "$batch_id" || result=1
+    restore_transaction_snapshot "$batch_id" || result=1
+    verify_snapshot_restored "$batch_id" || result=1
+    verify_transaction_ufw_rules_absent "$batch_id" || result=1
+    if (( result == 0 )); then
+        set_transaction_phase "$batch_id" rolled_back
+        return 0
+    fi
+    protect_failed_transaction "$batch_id" rollback_failed '无法验证事务快照恢复'
+    return 1
+}
+
+create_forwarding_transaction() {
+    local batch_id=$1 staged=$2 source=$3 in_if=$4 public_port=$5
+    local out_if=$6 landing_ip=$7 landing_port=$8 masquerade=$9
+    shift 9
+    local -a protocols=("$@")
+    local proto marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
+
+    validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
+    begin_transaction "$batch_id" create "$(IFS=,; echo "${protocols[*]}")" || return "$RESULT_PRECHECK_FAILED"
+    if ! apply_ipv4_forwarding_for_transaction "$batch_id"; then
+        set_transaction_phase "$batch_id" applying_ipv4 'IPv4 转发启用失败' || true
+    elif set_transaction_phase "$batch_id" applying_nat \
+        && apply_staged_nat_file "$staged" \
+        && set_transaction_phase "$batch_id" applying_ufw; then
+        for proto in "${protocols[@]}"; do
+            marker=$(managed_marker "$batch_id" "$proto")
+            if ! record_intended_ufw_marker "$batch_id" "$marker" \
+                || ! add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
+                "$landing_ip" "$landing_port" "$marker" \
+                || ! record_added_ufw_marker "$batch_id" "$marker"; then
+                set_transaction_phase "$batch_id" applying_ufw "UFW ${proto} 路由规则添加失败" || true
+                break
+            fi
+        done
+        if (( ${#protocols[@]} == $(wc -l < "${BACKUP_DIR}/${batch_id}/ufw-added.txt" 2>/dev/null || echo 0) )) \
+            && set_transaction_phase "$batch_id" committing_state \
+            && commit_forward_state "$batch_id" "$source" "$in_if" "$public_port" "$out_if" \
+                "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
+            && reload_ufw \
+            && set_transaction_phase "$batch_id" verifying; then
+            if verify_forwarding_batch "$batch_id" "${protocols[@]}"; then
+                set_transaction_phase "$batch_id" verified \
+                    && finish_transaction "$batch_id" committed \
+                    && return "$RESULT_OK"
+            else
+                failure_result=$RESULT_VERIFY_FAILED_ROLLED_BACK
+                set_transaction_phase "$batch_id" verifying '应用后本机验证失败' || true
+            fi
+        fi
+    fi
+
+    if rollback_created_forwarding "$batch_id"; then
+        return "$failure_result"
+    fi
+    return "$RESULT_ROLLBACK_FAILED"
+}
+
 insert_nat_rule_line() {
     local line=$1
     local tmp
@@ -1927,16 +2185,20 @@ delete_ufw_rules_by_comment() {
     local -a numbers=()
     local number
 
-    mapfile -t numbers < <(
+    while IFS= read -r number; do
+        [[ -n "$number" ]] && numbers+=("$number")
+    done < <(
         ufw status numbered 2>/dev/null \
             | grep -F "$comment" \
             | sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' \
             | sort -rn
     )
 
-    for number in "${numbers[@]}"; do
-        ufw --force delete "$number"
-    done
+    if (( ${#numbers[@]} > 0 )); then
+        for number in "${numbers[@]}"; do
+            ufw --force delete "$number"
+        done
+    fi
 }
 
 
@@ -1995,11 +2257,10 @@ delete_forward_by_id() {
     ok "已删除转发规则：$id"
 }
 
-add_forward_rule_interactive() {
+add_forward_rule_interactive_locked() {
     local default_in in_if public_port landing_ip landing_port default_out out_if source proto_choice masquerade
+    local batch_id staged mode description result
     local -a protocols=()
-
-    ensure_ipv4_forwarding
 
     default_in=$(default_interface)
     read -r -p "请输入中转机入站网卡 [默认 ${default_in:-无}]: " in_if
@@ -2041,21 +2302,84 @@ add_forward_rule_interactive() {
         warn "未启用 MASQUERADE 时，必须保证落地机的回程路由经过中转机"
     fi
 
-    echo
-    echo "即将添加："
-    echo "  来源：${source}"
-    echo "  入口：${in_if}:${public_port}"
-    echo "  协议：${protocols[*]}"
-    echo "  目标：${landing_ip}:${landing_port}"
-    echo "  出口：${out_if}"
-    echo "  SNAT：${masquerade}"
-    echo
-    confirm "确认添加该转发规则？" Y || { warn "已取消"; return 0; }
+    batch_id=$(new_batch_id)
+    staged=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
+    if ! stage_forward_nat "$staged" "$batch_id" "$source" "$in_if" "$public_port" \
+        "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
+        || ! validate_staged_nat "$staged"; then
+        rm -f -- "$staged"
+        error "NAT 暂存配置校验失败，未执行任何变更"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
 
-    local proto
-    for proto in "${protocols[@]}"; do
-        add_forward_protocol "$proto" "$source" "$in_if" "$public_port" "$out_if" "$landing_ip" "$landing_port" "$masquerade" || warn "${proto^^} 转发添加失败"
-    done
+    description="${protocols[*]} ${in_if}:${public_port} -> ${landing_ip}:${landing_port} via ${out_if}, source=${source}, masquerade=${masquerade}"
+    render_execution_preview create "lsec:${batch_id}:{${protocols[*]}}" "$description" \
+        "$BEFORE_RULES" "$STATE_FILE" '仅在确认执行后按需启用'
+    mode=$(select_execution_mode)
+    case "$mode" in
+        preflight)
+            rm -f -- "$staged"
+            info "前置检查与 NAT 语法校验通过，未执行任何变更"
+            return "$RESULT_OK"
+            ;;
+        cancel)
+            rm -f -- "$staged"
+            return "$RESULT_CANCELLED"
+            ;;
+    esac
+
+    if ! init_state; then
+        rm -f -- "$staged"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    if create_forwarding_transaction "$batch_id" "$staged" "$source" "$in_if" "$public_port" \
+        "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}"; then
+        result=$RESULT_OK
+    else
+        result=$?
+    fi
+    rm -f -- "$staged"
+    return "$result"
+}
+
+add_forward_rule_interactive() {
+    local result
+
+    if begin_mutation "创建完整端口转发"; then
+        :
+    else
+        result=$?
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if require_mutation_allowed; then
+        :
+    else
+        result=$?
+        end_mutation
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if run_dependency_preflight; then
+        :
+    else
+        result=$?
+        end_mutation
+        warn "$(result_message "$result")"
+        return "$result"
+    fi
+    if add_forward_rule_interactive_locked; then
+        result=$RESULT_OK
+    else
+        result=$?
+    fi
+    end_mutation
+    case "$result" in
+        0) ok "$(result_message "$result")" ;;
+        10) warn "$(result_message "$result")" ;;
+        *) error "$(result_message "$result")" ;;
+    esac
+    return "$result"
 }
 
 delete_forward_rule_interactive() {

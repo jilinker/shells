@@ -157,4 +157,244 @@ assert_eq "$(printf '1\n' | select_execution_mode 2>/dev/null)" execute
 assert_eq "$(printf '2\n' | select_execution_mode 2>/dev/null)" preflight
 assert_eq "$(printf '3\n' | select_execution_mode 2>/dev/null)" cancel
 
+nat_fixture="$TEST_TMP/nat-fixture.rules"
+cat > "$nat_fixture" <<'EOF'
+*filter
+:ufw-before-input - [0:0]
+COMMIT
+EOF
+BEFORE_RULES="$nat_fixture"
+staged_nat="$TEST_TMP/staged-before.rules"
+nat_before_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+stage_forward_nat "$staged_nat" batch-create any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$nat_before_hash"
+assert_file_contains "$staged_nat" 'lsec:batch-create:tcp:dnat'
+assert_file_contains "$staged_nat" 'lsec:batch-create:tcp:snat'
+assert_file_contains "$staged_nat" 'lsec:batch-create:udp:dnat'
+assert_file_contains "$staged_nat" 'lsec:batch-create:udp:snat'
+
+IPTABLES_RESTORE_FAIL=0
+IPTABLES_RESTORE_LOG="$TEST_TMP/iptables-restore.log"
+iptables-restore() {
+    printf '%s\n' "$*" >> "$IPTABLES_RESTORE_LOG"
+    cat >/dev/null
+    [[ "$IPTABLES_RESTORE_FAIL" == 0 ]]
+}
+validate_staged_nat "$staged_nat"
+assert_file_contains "$IPTABLES_RESTORE_LOG" '--test'
+IPTABLES_RESTORE_FAIL=1
+assert_status 1 validate_staged_nat "$staged_nat"
+IPTABLES_RESTORE_FAIL=0
+
+STATE_DIR="$TEST_TMP/create-state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/create-before.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+: > "$STATE_FILE"
+printf 'runtime_original\t0\nowned\tno\n' > "$IP_FORWARDING_STATE"
+create_staged="$TEST_TMP/create-staged.rules"
+stage_forward_nat "$create_staged" batch-success any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+
+UFW_ADDED_MARKERS=()
+UFW_ADD_COUNT=0
+UFW_FAIL_ADD_AT=0
+ufw() {
+    local previous= argument number index
+    case "$*" in
+        'status') printf 'Status: active\n'; return 0 ;;
+        'reload') return 0 ;;
+        'status numbered')
+            local marker index=1
+            if (( ${#UFW_ADDED_MARKERS[@]} > 0 )); then
+                for marker in "${UFW_ADDED_MARKERS[@]}"; do
+                    printf '[ %d] route ALLOW %s\n' "$index" "$marker"
+                    ((index += 1))
+                done
+            fi
+            return 0
+            ;;
+    esac
+    if [[ "$1" == --force && "$2" == delete ]]; then
+        number=$3
+        index=$((number - 1))
+        if (( ${#UFW_ADDED_MARKERS[@]} == 1 )); then
+            UFW_ADDED_MARKERS=()
+        else
+            unset 'UFW_ADDED_MARKERS[index]'
+            UFW_ADDED_MARKERS=("${UFW_ADDED_MARKERS[@]}")
+        fi
+        return 0
+    fi
+    for argument in "$@"; do
+        if [[ "$previous" == comment ]]; then
+            ((UFW_ADD_COUNT += 1))
+            if (( UFW_FAIL_ADD_AT > 0 && UFW_ADD_COUNT == UFW_FAIL_ADD_AT )); then
+                return 1
+            fi
+            UFW_ADDED_MARKERS+=("$argument")
+            return 0
+        fi
+        previous=$argument
+    done
+    return 0
+}
+
+original_ipv4_apply="$(declare -f apply_ipv4_forwarding_for_transaction 2>/dev/null || true)"
+apply_ipv4_forwarding_for_transaction() { return 0; }
+create_forwarding_transaction batch-success "$create_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+assert_file_contains "$BEFORE_RULES" 'lsec:batch-success:tcp:dnat'
+assert_file_contains "$STATE_FILE" $'lsec:batch-success:tcp\ttcp'
+assert_file_contains "$STATE_FILE" $'lsec:batch-success:udp\tudp'
+assert_file_contains "$TRANSACTION_DIR/batch-success.txn" $'phase\tcommitted'
+if [[ -n "$original_ipv4_apply" ]]; then
+    eval "$original_ipv4_apply"
+else
+    unset -f apply_ipv4_forwarding_for_transaction
+fi
+
+STATE_DIR="$TEST_TMP/create-failure-state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/create-failure-before.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+: > "$STATE_FILE"
+printf 'runtime_original\t0\nowned\tno\n' > "$IP_FORWARDING_STATE"
+failure_staged="$TEST_TMP/create-failure-staged.rules"
+stage_forward_nat "$failure_staged" batch-ufw-fail any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+failure_before_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+UFW_ADDED_MARKERS=()
+UFW_ADD_COUNT=0
+UFW_FAIL_ADD_AT=2
+apply_ipv4_forwarding_for_transaction() { return 0; }
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-ufw-fail "$failure_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$failure_before_hash"
+assert_eq "$(wc -c < "$STATE_FILE" | tr -d ' ')" 0
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified rollback must not create protected lock'
+unset -f apply_ipv4_forwarding_for_transaction
+UFW_FAIL_ADD_AT=0
+
+STATE_DIR="$TEST_TMP/create-validation-state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/create-validation-before.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+: > "$STATE_FILE"
+: > "$IP_FORWARDING_STATE"
+validation_staged="$TEST_TMP/create-validation-staged.rules"
+stage_forward_nat "$validation_staged" batch-validation any eth0 52350 eth1 10.0.0.2 52350 yes tcp
+validation_before_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+IPTABLES_RESTORE_FAIL=1
+apply_ipv4_forwarding_for_transaction() { return 0; }
+assert_status "$RESULT_PRECHECK_FAILED" create_forwarding_transaction \
+    batch-validation "$validation_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$validation_before_hash"
+[[ ! -e "$TRANSACTION_DIR/batch-validation.txn" ]] || fail 'invalid staging created a journal'
+IPTABLES_RESTORE_FAIL=0
+unset -f apply_ipv4_forwarding_for_transaction
+
+STATE_DIR="$TEST_TMP/create-record-state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/create-record-before.rules"
+printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$BEFORE_RULES"
+mkdir -p "$STATE_DIR"
+: > "$STATE_FILE"
+: > "$IP_FORWARDING_STATE"
+record_staged="$TEST_TMP/create-record-staged.rules"
+stage_forward_nat "$record_staged" batch-record-fail any eth0 52350 eth1 10.0.0.2 52350 yes tcp
+UFW_ADDED_MARKERS=()
+UFW_ADD_COUNT=0
+apply_ipv4_forwarding_for_transaction() { return 0; }
+original_record_added="$(declare -f record_added_ufw_marker)"
+record_added_ufw_marker() { return 1; }
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-record-fail "$record_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp >/dev/null 2>&1
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
+eval "$original_record_added"
+unset -f apply_ipv4_forwarding_for_transaction
+
+prepare_create_failure_case() {
+    local batch=$1
+    STATE_DIR="$TEST_TMP/${batch}-state"
+    configure_state_paths
+    BEFORE_RULES="$TEST_TMP/${batch}-before.rules"
+    printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$BEFORE_RULES"
+    mkdir -p "$STATE_DIR"
+    : > "$STATE_FILE"
+    : > "$IP_FORWARDING_STATE"
+    FAILURE_STAGED="$TEST_TMP/${batch}-staged.rules"
+    stage_forward_nat "$FAILURE_STAGED" "$batch" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+    FAILURE_BEFORE_HASH="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
+    UFW_ADDED_MARKERS=()
+    UFW_ADD_COUNT=0
+    UFW_FAIL_ADD_AT=0
+}
+
+original_apply_staged="$(declare -f apply_staged_nat_file)"
+prepare_create_failure_case batch-nat-fail
+apply_ipv4_forwarding_for_transaction() { return 0; }
+apply_staged_nat_file() { return 1; }
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-nat-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$FAILURE_BEFORE_HASH"
+eval "$original_apply_staged"
+unset -f apply_ipv4_forwarding_for_transaction
+
+original_commit_state="$(declare -f commit_forward_state)"
+prepare_create_failure_case batch-state-fail
+apply_ipv4_forwarding_for_transaction() { return 0; }
+commit_forward_state() { return 1; }
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-state-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
+eval "$original_commit_state"
+unset -f apply_ipv4_forwarding_for_transaction
+
+original_verify_batch="$(declare -f verify_forwarding_batch)"
+prepare_create_failure_case batch-verify-fail
+apply_ipv4_forwarding_for_transaction() { return 0; }
+verify_forwarding_batch() { return 1; }
+assert_status "$RESULT_VERIFY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-verify-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
+[[ ! -e "$STATE_VERSION_FILE" ]] || fail 'rollback left a state.version that did not exist before'
+eval "$original_verify_batch"
+unset -f apply_ipv4_forwarding_for_transaction
+
+original_restore_snapshot="$(declare -f restore_transaction_snapshot)"
+prepare_create_failure_case batch-rollback-fail
+apply_ipv4_forwarding_for_transaction() { return 0; }
+apply_staged_nat_file() { return 1; }
+restore_transaction_snapshot() { return 1; }
+assert_status "$RESULT_ROLLBACK_FAILED" create_forwarding_transaction \
+    batch-rollback-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbatch-rollback-fail'
+assert_status "$RESULT_PROTECTED_LOCKOUT" require_mutation_allowed >/dev/null 2>&1
+eval "$original_apply_staged"
+eval "$original_restore_snapshot"
+unset -f apply_ipv4_forwarding_for_transaction
+
+forward_create_definition="$(declare -f add_forward_rule_interactive_locked; declare -f add_forward_rule_interactive)"
+assert_not_contains "$forward_create_definition" 'ensure_ipv4_forwarding'
+assert_not_contains "$forward_create_definition" 'add_forward_protocol'
+assert_contains "$forward_create_definition" 'stage_forward_nat'
+assert_contains "$forward_create_definition" 'render_execution_preview'
+assert_contains "$forward_create_definition" 'select_execution_mode'
+assert_contains "$forward_create_definition" 'create_forwarding_transaction'
+
+original_begin_mutation="$(declare -f begin_mutation)"
+begin_mutation() { return "$RESULT_PRECHECK_FAILED"; }
+assert_status "$RESULT_PRECHECK_FAILED" add_forward_rule_interactive >/dev/null 2>&1
+eval "$original_begin_mutation"
+
+bad_state_parent="$TEST_TMP/not-a-directory"
+printf 'file\n' > "$bad_state_parent"
+STATE_DIR="$bad_state_parent/state"
+configure_state_paths
+BEFORE_RULES="$TEST_TMP/existing-before.rules"
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+assert_status 1 init_state >/dev/null 2>&1
+
 printf 'linux security transaction test passed\n'
