@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="4.0.0"
+VERSION="4.0.1"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -386,7 +386,8 @@ rollback_legacy_migration() {
     remove_transaction_ufw_rules "$batch_id" || result=1
     restore_transaction_snapshot "$batch_id" || result=1
     restore_legacy_ufw_rules "$mapping" || result=1
-    reload_ufw || result=1
+    sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+        "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt" || result=1
     verify_snapshot_restored "$batch_id" || result=1
     verify_legacy_ufw_mapping "$mapping" || result=1
     if (( result == 0 )); then
@@ -406,6 +407,7 @@ migrate_legacy_forwarding_state() {
     if awk -F '\t' '$2 != "legacy-exact" {bad=1} END {exit bad ? 0 : 1}' <<< "$audit"; then
         return "$RESULT_REPAIR_REQUIRED"
     fi
+    verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     mapping=$(mktemp) || return "$RESULT_PRECHECK_FAILED"
     staged=$(mktemp) || { rm -f -- "$mapping"; return "$RESULT_PRECHECK_FAILED"; }
     render_legacy_migration_mapping "$batch_id" > "$mapping" || {
@@ -425,6 +427,15 @@ migrate_legacy_forwarding_state() {
         rollback_legacy_migration "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
         return "$RESULT_APPLY_FAILED_ROLLED_BACK"
     }
+    if ! render_legacy_nat_sync_markers "$mapping" > "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt" \
+        || ! chmod 600 "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt"; then
+        if rollback_legacy_migration "$batch_id"; then
+            rm -f -- "$mapping" "$staged"
+            return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        fi
+        rm -f -- "$mapping" "$staged"
+        return "$RESULT_ROLLBACK_FAILED"
+    fi
     expected_count=$(awk 'NF {count++} END {print count + 0}' "$mapping")
     if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
         && set_transaction_phase "$batch_id" applying_ufw; then
@@ -444,7 +455,8 @@ migrate_legacy_forwarding_state() {
             && set_transaction_phase "$batch_id" committing_state \
             && atomic_write "$STATE_FILE" render_migrated_forwarding_state "$mapping" \
             && atomic_write "$STATE_VERSION_FILE" write_state_schema_version \
-            && reload_ufw \
+            && sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+                "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt" \
             && set_transaction_phase "$batch_id" verifying \
             && verify_migrated_mapping "$mapping"; then
             set_transaction_phase "$batch_id" verified \
@@ -457,6 +469,14 @@ migrate_legacy_forwarding_state() {
         return "$RESULT_APPLY_FAILED_ROLLED_BACK"
     fi
     return "$RESULT_ROLLBACK_FAILED"
+}
+
+render_legacy_nat_sync_markers() {
+    local mapping=$1 old_id marker rest
+    while IFS=$'\t' read -r old_id marker rest; do
+        [[ -n "$old_id" && -n "$marker" ]] || continue
+        printf 'ufw-relay:%s\n%s\n' "$old_id" "$marker" || return 1
+    done < "$mapping"
 }
 
 verify_migrated_mapping() {
@@ -780,7 +800,11 @@ restore_snapshot_transaction() {
     restore_batch="restore-$(new_batch_id)"
     begin_transaction "$restore_batch" restore "$target_batch" || return "$RESULT_PRECHECK_FAILED"
     delete_intent="${BACKUP_DIR}/${restore_batch}/ufw-delete-intended.tsv"
-    install -m 600 /dev/null "$delete_intent" || return "$RESULT_PRECHECK_FAILED"
+    if ! install -m 600 /dev/null "$delete_intent"; then
+        rollback_replaced_forwarding "$restore_batch" \
+            && return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        return "$RESULT_ROLLBACK_FAILED"
+    fi
     set_transaction_phase "$restore_batch" applying_ufw || result=1
 
     if (( result == 0 )) && [[ -f "$STATE_FILE" ]]; then
@@ -813,6 +837,7 @@ restore_snapshot_transaction() {
     fi
 
     if (( result == 0 )) && restore_transaction_snapshot "$target_batch" \
+        && reconcile_all_live_managed_nat_to_file "$BEFORE_RULES" \
         && verify_snapshot_restored "$target_batch" && is_ufw_active; then
         while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
             [[ -n "$marker" ]] || continue
@@ -2856,6 +2881,10 @@ normalize_iptables_rule() {
     sed -E 's/--comment "([^"]+)"/--comment \1/g; s/ -m (tcp|udp)( |$)/ /g; s/(-[sd] [0-9.]+)\/32([[:space:]]|$)/\1\2/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
+normalize_iptables_rule_for_delete() {
+    sed -E 's/--comment "([^"]+)"/--comment \1/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
 verify_nat_marker_effective() {
     local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch
     local expected_dnat expected_snat live_nat dnat_count snat_count
@@ -2959,7 +2988,7 @@ restore_transaction_snapshot() {
     if [[ "$runtime_value" == 0 || "$runtime_value" == 1 ]]; then
         sysctl -w "net.ipv4.ip_forward=${runtime_value}" >/dev/null || return 1
     fi
-    reload_ufw
+    return 0
 }
 
 verify_snapshot_restored() {
@@ -2987,10 +3016,140 @@ verify_snapshot_restored() {
 }
 
 verify_nat_file_effective() {
-    local expected_file=$1 expected live
-    expected=$(awk '/^-A (PREROUTING|POSTROUTING) / && /(lsec:|ufw-relay:)/ {print}' "$expected_file" | normalize_iptables_rule) || return 1
-    live=$(iptables-save -t nat 2>/dev/null | awk '/^-A (PREROUTING|POSTROUTING) / && /(lsec:|ufw-relay:)/ {print}' | normalize_iptables_rule) || return 1
-    [[ "$expected" == "$live" ]]
+    local expected_file=$1 chain expected live live_dump
+    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
+    for chain in PREROUTING POSTROUTING; do
+        expected=$(normalize_iptables_rule < "$expected_file" \
+            | managed_nat_rules_for_chain "$chain") || return 1
+        live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump") || return 1
+        [[ "$expected" == "$live" ]] || return 1
+    done
+}
+
+managed_nat_rules_for_chain() {
+    local chain=$1
+    awk -v chain="$chain" '
+        $1 == "-A" && $2 == chain {
+            for (i = 1; i < NF; i++) {
+                if ($i == "--comment" && ($(i + 1) ~ /^lsec:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+:(dnat|snat)$/ \
+                    || $(i + 1) ~ /^ufw-relay:[A-Za-z0-9._-]+:(dnat|snat)$/)) {
+                    print
+                    break
+                }
+            }
+        }
+    '
+}
+
+validate_nat_ownership_marker() {
+    local marker=$1
+    [[ "$marker" =~ ^lsec:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$ \
+        || "$marker" =~ ^ufw-relay:[A-Za-z0-9._-]+$ ]]
+}
+
+list_live_nat_rules_for_marker() {
+    local marker=$1 live_dump chain
+    validate_nat_ownership_marker "$marker" || return 1
+    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
+    for chain in PREROUTING POSTROUTING; do
+        managed_nat_rules_for_chain "$chain" <<< "$live_dump" \
+            | awk -v dnat="${marker}:dnat" -v snat="${marker}:snat" '
+                {for (i = 1; i < NF; i++) if ($i == "--comment" && ($(i + 1) == dnat || $(i + 1) == snat)) {print; break}}
+            '
+    done
+}
+
+list_live_managed_nat_rules() {
+    local live_dump
+    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
+    managed_nat_rules_for_chain PREROUTING <<< "$live_dump"
+    managed_nat_rules_for_chain POSTROUTING <<< "$live_dump"
+}
+
+delete_live_nat_rule_line() {
+    local line=$1
+    local -a arguments=()
+    read -r -a arguments <<< "$line"
+    (( ${#arguments[@]} >= 3 )) || return 1
+    [[ "${arguments[0]}" == -A ]] || return 1
+    [[ "${arguments[1]}" == PREROUTING || "${arguments[1]}" == POSTROUTING ]] || return 1
+    arguments[0]=-D
+    iptables -t nat "${arguments[@]}"
+}
+
+clear_live_managed_nat_rules() {
+    local line rules_file remaining result=0
+    rules_file=$(mktemp) || return 1
+    list_live_managed_nat_rules > "$rules_file" || { rm -f -- "$rules_file"; return 1; }
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        delete_live_nat_rule_line "$line" || { result=1; break; }
+    done < "$rules_file"
+    rm -f -- "$rules_file"
+    (( result == 0 )) || return 1
+    remaining=$(list_live_managed_nat_rules) || return 1
+    [[ -z "$remaining" ]]
+}
+
+clear_live_nat_rules_for_marker() {
+    local marker=$1 line rules_file remaining result=0
+    validate_nat_ownership_marker "$marker" || return 1
+    rules_file=$(mktemp) || return 1
+    list_live_nat_rules_for_marker "$marker" > "$rules_file" \
+        || { rm -f -- "$rules_file"; return 1; }
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        delete_live_nat_rule_line "$line" || { result=1; break; }
+    done < "$rules_file"
+    rm -f -- "$rules_file"
+    (( result == 0 )) || return 1
+    remaining=$(list_live_nat_rules_for_marker "$marker") || return 1
+    [[ -z "$remaining" ]]
+}
+
+list_managed_nat_markers_in_file() {
+    local file=$1 chain
+    for chain in PREROUTING POSTROUTING; do
+        normalize_iptables_rule < "$file" | managed_nat_rules_for_chain "$chain"
+    done | awk '
+        {for (i = 1; i < NF; i++) if ($i == "--comment") {
+            marker=$(i + 1)
+            sub(/:(dnat|snat)$/, "", marker)
+            print marker
+            break
+        }}
+    ' | sort -u
+}
+
+sync_live_nat_marker_files_to_file() {
+    local target_file=$1 marker_file line marker target_markers
+    shift
+    target_markers=$(mktemp) || return 1
+    list_managed_nat_markers_in_file "$target_file" > "$target_markers" \
+        || { rm -f -- "$target_markers"; return 1; }
+    while IFS= read -r marker; do
+        [[ -n "$marker" ]] || continue
+        clear_live_nat_rules_for_marker "$marker" \
+            || { rm -f -- "$target_markers"; return 1; }
+    done < "$target_markers"
+    rm -f -- "$target_markers"
+    for marker_file in "$@"; do
+        [[ -f "$marker_file" ]] || continue
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            marker=${line%%$'\t'*}
+            clear_live_nat_rules_for_marker "$marker" || return 1
+        done < "$marker_file"
+    done
+    reload_ufw || return 1
+    verify_nat_file_effective "$target_file"
+}
+
+reconcile_all_live_managed_nat_to_file() {
+    local target_file=$1
+    clear_live_managed_nat_rules || return 1
+    reload_ufw || return 1
+    verify_nat_file_effective "$target_file"
 }
 
 remove_transaction_ufw_rules() {
@@ -3037,6 +3196,8 @@ rollback_created_forwarding() {
     local result=0
     remove_transaction_ufw_rules "$batch_id" || result=1
     restore_transaction_snapshot "$batch_id" || result=1
+    sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+        "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" || result=1
     verify_snapshot_restored "$batch_id" || result=1
     verify_transaction_ufw_rules_absent "$batch_id" || result=1
     if (( result == 0 )); then
@@ -3056,6 +3217,7 @@ create_forwarding_transaction() {
 
     require_current_state_schema || return $?
     is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     begin_transaction "$batch_id" create "$(IFS=,; echo "${protocols[*]}")" || return "$RESULT_PRECHECK_FAILED"
     if ! apply_ipv4_forwarding_for_transaction "$batch_id"; then
@@ -3077,7 +3239,8 @@ create_forwarding_transaction() {
             && set_transaction_phase "$batch_id" committing_state \
             && commit_forward_state "$batch_id" "$source" "$in_if" "$public_port" "$out_if" \
                 "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
-            && reload_ufw \
+            && sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+                "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" \
             && set_transaction_phase "$batch_id" verifying; then
             if verify_forwarding_batch "$batch_id" "${protocols[@]}"; then
                 set_transaction_phase "$batch_id" verified \
@@ -3192,7 +3355,8 @@ rollback_deleted_forwarding() {
     local batch_id=$1 result=0
     restore_transaction_snapshot "$batch_id" || result=1
     restore_deleted_ufw_rules "$batch_id" || result=1
-    reload_ufw || result=1
+    sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+        "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" || result=1
     verify_snapshot_restored "$batch_id" || result=1
     verify_deleted_ufw_rules_restored "$batch_id" || result=1
     if (( result == 0 )); then
@@ -3216,6 +3380,7 @@ delete_forwarding_transaction() {
 
     require_current_state_schema || return $?
     is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     (( ${#markers[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     for marker in "${markers[@]}"; do
@@ -3242,7 +3407,8 @@ delete_forwarding_transaction() {
             && set_transaction_phase "$batch_id" committing_state \
             && commit_forward_state_removal "${markers[@]}" \
             && { [[ "$restore_ipv4" == no ]] || restore_owned_ipv4_forwarding; } \
-            && reload_ufw \
+            && sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+                "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" \
             && set_transaction_phase "$batch_id" verifying; then
             if verify_forwarding_markers_absent "${markers[@]}"; then
                 set_transaction_phase "$batch_id" verified \
@@ -3345,11 +3511,18 @@ commit_forward_state_replacement() {
 }
 
 rollback_replaced_forwarding() {
-    local batch_id=$1 result=0
+    local batch_id=$1 result=0 operation
     remove_transaction_ufw_rules "$batch_id" || result=1
     restore_transaction_snapshot "$batch_id" || result=1
     restore_deleted_ufw_rules "$batch_id" || result=1
-    reload_ufw || result=1
+    operation=$(transaction_value "${TRANSACTION_DIR}/${batch_id}.txn" operation 2>/dev/null || true)
+    if [[ "$operation" == restore ]]; then
+        reconcile_all_live_managed_nat_to_file "$BEFORE_RULES" || result=1
+    else
+        sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+            "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" \
+            "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" || result=1
+    fi
     verify_snapshot_restored "$batch_id" || result=1
     verify_transaction_ufw_rules_absent "$batch_id" || result=1
     verify_deleted_ufw_rules_restored "$batch_id" || result=1
@@ -3370,6 +3543,7 @@ replace_forwarding_transaction() {
 
     require_current_state_schema || return $?
     is_ufw_active || return "$RESULT_PRECHECK_FAILED"
+    verify_nat_file_effective "$BEFORE_RULES" || return "$RESULT_REPAIR_REQUIRED"
     IFS=',' read -r -a old_markers <<< "$old_csv"
     (( ${#old_markers[@]} > 0 && ${#protocols[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
@@ -3409,7 +3583,9 @@ replace_forwarding_transaction() {
             && set_transaction_phase "$batch_id" committing_state \
             && commit_forward_state_replacement "$batch_id" "$old_csv" "$source" "$in_if" \
                 "$public_port" "$out_if" "$landing_ip" "$landing_port" "$masquerade" "${protocols[@]}" \
-            && reload_ufw \
+            && sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+                "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" \
+                "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" \
             && set_transaction_phase "$batch_id" verifying; then
             if verify_forwarding_markers_absent "${old_markers[@]}" \
                 && verify_forwarding_batch "$batch_id" "${protocols[@]}"; then

@@ -300,6 +300,29 @@ iptables-save() {
     awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"
 }
 
+IPTABLES_FAIL_DELETE=0
+IPTABLES_LAST_DELETE=
+iptables() {
+    local desired temp
+    [[ "$1" == -t && "$2" == nat && "$3" == -D ]] || return 1
+    (( IPTABLES_FAIL_DELETE == 0 )) || return 1
+    shift 3
+    desired="-A $*"
+    IPTABLES_LAST_DELETE=$desired
+    temp=$(mktemp) || return 1
+    if normalize_iptables_rule_for_delete < "$LIVE_NAT_FILE" \
+        | awk -v desired="$desired" '
+            $0 == desired && !removed {removed=1; next}
+            {print}
+            END {exit removed ? 0 : 1}
+        ' > "$temp"; then
+        mv -f -- "$temp" "$LIVE_NAT_FILE"
+        return 0
+    fi
+    rm -f -- "$temp"
+    return 1
+}
+
 UFW_ADDED_MARKERS=('lsec:prefix:tcp' 'lsec:prefix:tcp-extra')
 UFW_DELETE_COUNT=0
 delete_ufw_rules_by_comment 'lsec:prefix:tcp'
@@ -313,6 +336,18 @@ original_ipv4_apply="$(declare -f apply_ipv4_forwarding_for_transaction 2>/dev/n
 original_verify_ipv4="$(declare -f verify_ipv4_forwarding_effective)"
 apply_ipv4_forwarding_for_transaction() { return 0; }
 verify_ipv4_forwarding_effective() { return 0; }
+printf '%s\n' \
+    '-A PREROUTING -p tcp --dport 6000 -m comment --comment lsec:anything:dnat -j DNAT --to-destination 10.0.0.9:6000' \
+    '-A POSTROUTING -p tcp -m comment --comment ufw-relay:bad;id:snat -j MASQUERADE' >> "$LIVE_NAT_FILE"
+assert_not_contains "$(list_live_managed_nat_rules)" 'lsec:anything:dnat'
+assert_not_contains "$(list_live_managed_nat_rules)" 'ufw-relay:bad;id:snat'
+assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
+printf '%s\n' '-A PREROUTING -p tcp --dport 6001 -m comment --comment lsec:orphan:tcp:dnat -j DNAT --to-destination 10.0.0.9:6001' >> "$LIVE_NAT_FILE"
+assert_status "$RESULT_REPAIR_REQUIRED" create_forwarding_transaction \
+    batch-success "$create_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+[[ ! -e "$TRANSACTION_DIR/batch-success.txn" ]] || fail 'live-only orphan started a normal transaction'
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 create_forwarding_transaction batch-success "$create_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
 assert_file_contains "$BEFORE_RULES" 'lsec:batch-success:tcp:dnat'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:tcp\ttcp'
@@ -334,6 +369,33 @@ iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; printf '%s\n' '-A PREROUTING -p tcp --dport 9999 -j DNAT --to-destination 172.17.0.2:9999'; }
 assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+iptables-save() {
+    awk '/^-A PREROUTING / {print}' "$LIVE_NAT_FILE"
+    awk '/^-A POSTROUTING / {print}' "$LIVE_NAT_FILE"
+}
+assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+iptables-save() {
+    awk '/^-A PREROUTING / {rules[++count]=$0} END {for (i=count; i>=1; i--) print rules[i]}' "$LIVE_NAT_FILE"
+    awk '/^-A POSTROUTING / {print}' "$LIVE_NAT_FILE"
+}
+assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+IPTABLES_FAIL_DELETE=1
+assert_status 1 clear_live_managed_nat_rules
+assert_contains "$(iptables-save -t nat)" 'lsec:batch-success:'
+IPTABLES_FAIL_DELETE=0
+UFW_RELOAD_SYNC=0
+restore_transaction_snapshot batch-success
+sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
+    "$BACKUP_DIR/batch-success/ufw-intended.txt"
+assert_not_contains "$(iptables-save -t nat)" 'lsec:batch-success:'
+UFW_RELOAD_SYNC=1
+printf '%s\n' '-A PREROUTING -i eth0 -p tcp -m tcp --dport 6002 -m comment --comment "lsec:exact-delete:tcp:dnat" -j DNAT --to-destination 10.0.0.9:6002' > "$LIVE_NAT_FILE"
+clear_live_nat_rules_for_marker 'lsec:exact-delete:tcp'
+assert_contains "$IPTABLES_LAST_DELETE" '-m tcp'
+assert_contains "$IPTABLES_LAST_DELETE" '--comment lsec:exact-delete:tcp:dnat'
+assert_not_contains "$IPTABLES_LAST_DELETE" '"'
 if [[ -n "$original_ipv4_apply" ]]; then
     eval "$original_ipv4_apply"
 else
@@ -454,7 +516,7 @@ eval "$original_ipv4_apply"
 prepare_create_failure_case batch-reload-noop
 apply_ipv4_forwarding_for_transaction() { return 0; }
 UFW_RELOAD_SYNC=0
-assert_status "$RESULT_VERIFY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-reload-noop "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'reload no-op with verified rollback activated protected lock'
 UFW_RELOAD_SYNC=1
@@ -788,6 +850,7 @@ configure_state_paths
 mkdir -p "$STATE_DIR"
 BEFORE_RULES="$TEST_TMP/recovery-before.rules"
 printf 'original\n' > "$BEFORE_RULES"
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 : > "$STATE_FILE"
 UFW_SYSCTL_FILE="$TEST_TMP/recovery-sysctl.conf"
 printf 'net/ipv4/ip_forward=1\n' > "$UFW_SYSCTL_FILE"

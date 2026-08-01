@@ -14,7 +14,7 @@ grep -Fq "$remote_url" "$ROOT_DIR/README.md"
 grep -Fq "bash <(curl -fsSL $remote_url)" "$ROOT_DIR/README.md"
 grep -Fq "bash <(wget -qO- $remote_url)" "$ROOT_DIR/README.md"
 grep -Fq "$remote_url" "$ROOT_DIR/linux_security.sh"
-grep -Fq 'VERSION="4.0.0"' "$ROOT_DIR/linux_security.sh"
+grep -Fq 'VERSION="4.0.1"' "$ROOT_DIR/linux_security.sh"
 
 # 断言命令失败
 assert_fails() {
