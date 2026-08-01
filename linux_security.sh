@@ -19,6 +19,7 @@ OPERATION_LOCK=
 PROTECTED_LOCK=
 TRANSACTION_DIR=
 BACKUP_DIR=
+IP_FORWARDING_STATE=
 BEFORE_RULES="${LSEC_BEFORE_RULES:-/etc/ufw/before.rules}"
 NAT_BEGIN="# BEGIN UFW-RELAY-MANAGER RULES"
 NAT_END="# END UFW-RELAY-MANAGER RULES"
@@ -57,6 +58,7 @@ readonly RESULT_VERIFY_FAILED_ROLLED_BACK=50
 readonly RESULT_PROTECTED_LOCKOUT=60
 readonly RESULT_REPAIR_REQUIRED=70
 readonly MUTATION_LOCK_FD=9
+readonly STATE_SCHEMA_VERSION=2
 MUTATION_LOCK_HELD=0
 
 configure_state_paths() {
@@ -66,6 +68,7 @@ configure_state_paths() {
     PROTECTED_LOCK="${STATE_DIR}/protected.lock"
     TRANSACTION_DIR="${STATE_DIR}/transactions"
     BACKUP_DIR="${STATE_DIR}/backups"
+    IP_FORWARDING_STATE="${STATE_DIR}/ip-forwarding.tsv"
 }
 
 configure_state_paths
@@ -154,6 +157,113 @@ require_mutation_allowed() {
         return "$RESULT_PROTECTED_LOCKOUT"
     fi
     return "$RESULT_OK"
+}
+
+# 使用目标文件所在目录中的临时文件，并以 rename 原子替换。
+atomic_write() {
+    local destination=$1 writer=$2 temp
+    shift 2
+
+    temp=$(mktemp "${destination}.tmp.XXXXXX") || return 1
+    if ! chmod 600 "$temp"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+    if "$writer" "$@" > "$temp"; then
+        if mv -f -- "$temp" "$destination"; then
+            return 0
+        fi
+    fi
+    rm -f -- "$temp"
+    return 1
+}
+
+new_batch_id() {
+    printf '%s-%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"
+}
+
+write_transaction_record() {
+    local batch_id=$1 operation=$2 phase=$3 snapshot=$4 rule_ids=$5 last_error=${6:-}
+    printf 'schema\t%s\n' "$STATE_SCHEMA_VERSION"
+    printf 'batch_id\t%s\n' "$batch_id"
+    printf 'operation\t%s\n' "$operation"
+    printf 'phase\t%s\n' "$phase"
+    printf 'created_at\t%s\n' "$(date -u +%FT%TZ)"
+    printf 'updated_at\t%s\n' "$(date -u +%FT%TZ)"
+    printf 'snapshot\t%s\n' "$snapshot"
+    printf 'rule_ids\t%s\n' "$rule_ids"
+    printf 'last_error\t%s\n' "$last_error"
+}
+
+snapshot_metadata() {
+    local batch_id=$1 operation=$2
+    printf 'schema\t%s\n' "$STATE_SCHEMA_VERSION"
+    printf 'batch_id\t%s\n' "$batch_id"
+    printf 'operation\t%s\n' "$operation"
+    printf 'created_at\t%s\n' "$(date -u +%FT%TZ)"
+    printf 'status\tactive\n'
+}
+
+snapshot_copy_or_empty() {
+    local source=$1 destination=$2
+    if [[ -f "$source" ]]; then
+        install -m 600 "$source" "$destination"
+    else
+        install -m 600 /dev/null "$destination"
+    fi
+}
+
+snapshot_current_state() {
+    local batch_id=$1 operation=$2 snapshot="${BACKUP_DIR}/${batch_id}"
+
+    install -d -m 700 "$TRANSACTION_DIR" "$BACKUP_DIR" "$snapshot" || return 1
+    snapshot_copy_or_empty "$BEFORE_RULES" "$snapshot/before.rules" || return 1
+    snapshot_copy_or_empty "$STATE_FILE" "$snapshot/forwarding.tsv" || return 1
+    snapshot_copy_or_empty "$IP_FORWARDING_STATE" "$snapshot/ip-forwarding.tsv" || return 1
+    atomic_write "$snapshot/metadata.tsv" snapshot_metadata "$batch_id" "$operation"
+}
+
+begin_transaction() {
+    local batch_id=$1 operation=$2 rule_ids=${3:-}
+    local snapshot="${BACKUP_DIR}/${batch_id}"
+
+    snapshot_current_state "$batch_id" "$operation" || return 1
+    atomic_write "${TRANSACTION_DIR}/${batch_id}.txn" write_transaction_record \
+        "$batch_id" "$operation" prepared "$snapshot" "$rule_ids" ''
+}
+
+transaction_value() {
+    local journal=$1 key=$2
+    awk -F '\t' -v key="$key" '$1 == key {sub(/^[^\t]*\t/, ""); print; exit}' "$journal"
+}
+
+render_transaction_phase() {
+    local journal=$1 phase=$2 last_error=${3:-}
+    awk -F '\t' -v OFS='\t' -v phase="$phase" -v now="$(date -u +%FT%TZ)" \
+        -v last_error="$last_error" '
+        $1 == "phase" {print "phase", phase; next}
+        $1 == "updated_at" {print "updated_at", now; next}
+        $1 == "last_error" {print "last_error", last_error; next}
+        {print}
+    ' "$journal"
+}
+
+set_transaction_phase() {
+    local batch_id=$1 phase=$2 last_error=${3:-}
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 1
+    atomic_write "$journal" render_transaction_phase "$journal" "$phase" "$last_error"
+}
+
+finish_transaction() {
+    local batch_id=$1 terminal_phase=$2
+    local journal="${TRANSACTION_DIR}/${batch_id}.txn" current
+    [[ -f "$journal" ]] || return 1
+    current=$(transaction_value "$journal" phase)
+    if [[ "$terminal_phase" == committed && "$current" != verified ]]; then
+        return 1
+    fi
+    set_transaction_phase "$batch_id" "$terminal_phase"
 }
 
 # 记录安全检查结果

@@ -34,6 +34,10 @@ assert_status() {
     assert_eq "$actual" "$expected"
 }
 
+file_mode() {
+    stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+}
+
 source_manager() {
     LSEC_SOURCE_ONLY=1 source "$TEST_ROOT/linux_security.sh"
 }
