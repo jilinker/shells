@@ -61,6 +61,12 @@ atomic_write "$atomic_target" write_complete_fixture
 assert_eq "$(cat "$atomic_target")" "complete"
 assert_eq "$(file_mode "$atomic_target")" 600
 
+missing_state="$TEST_TMP/does-not-exist"
+printf 'preserved\n' > "$atomic_target"
+assert_status 1 atomic_write "$atomic_target" render_state_with_forward_batch \
+    "$missing_state" batch-read-fail any eth0 52350 eth1 10.0.0.2 52350 yes tcp
+assert_eq "$(cat "$atomic_target")" preserved
+
 BEFORE_RULES="$TEST_TMP/before.rules"
 IP_FORWARDING_STATE="$STATE_DIR/ip-forwarding.tsv"
 mkdir -p "$STATE_DIR"
@@ -121,20 +127,25 @@ dependency_available() {
     [[ " $AVAILABLE_DEPENDENCIES " == *" $1 "* ]]
 }
 assert_status 1 collect_missing_dependencies
-assert_eq "${MISSING_DEPENDENCIES[*]}" 'iptables iptables-restore'
-AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+assert_eq "${MISSING_DEPENDENCIES[*]}" 'iptables iptables-save iptables-restore'
+AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-save iptables-restore sysctl'
 assert_status 0 collect_missing_dependencies
 
 original_confirm="$(declare -f confirm)"
 confirm() { return 1; }
 AVAILABLE_DEPENDENCIES='flock'
 assert_status "$RESULT_CANCELLED" run_dependency_preflight >/dev/null 2>&1
+AVAILABLE_DEPENDENCIES=''
+assert_status "$RESULT_CANCELLED" bootstrap_flock_dependency >/dev/null 2>&1
+printf 'batch_id\tprotected-bootstrap\n' > "$PROTECTED_LOCK"
+assert_status "$RESULT_PROTECTED_LOCKOUT" bootstrap_flock_dependency >/dev/null 2>&1
+rm -f "$PROTECTED_LOCK"
 
 install_attempts=0
 confirm() { return 0; }
 install_missing_dependencies() {
     ((install_attempts += 1))
-    AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+    AVAILABLE_DEPENDENCIES='flock ufw iptables iptables-save iptables-restore sysctl'
 }
 run_dependency_preflight >/dev/null
 assert_eq "$install_attempts" 1
@@ -172,6 +183,23 @@ assert_file_contains "$staged_nat" 'lsec:batch-create:tcp:dnat'
 assert_file_contains "$staged_nat" 'lsec:batch-create:tcp:snat'
 assert_file_contains "$staged_nat" 'lsec:batch-create:udp:dnat'
 assert_file_contains "$staged_nat" 'lsec:batch-create:udp:snat'
+assert_status 0 validate_nat_managed_section "$staged_nat"
+
+duplicate_markers="$TEST_TMP/duplicate-markers.rules"
+cp "$staged_nat" "$duplicate_markers"
+printf '%s\n' "$NAT_BEGIN" "$NAT_END" >> "$duplicate_markers"
+assert_status 1 validate_nat_managed_section "$duplicate_markers"
+BEFORE_RULES="$duplicate_markers"
+assert_status 1 ensure_nat_managed_section >/dev/null 2>&1
+[[ -s "$PROTECTED_LOCK" ]] || fail 'damaged NAT markers did not activate protected lock'
+rm -f "$PROTECTED_LOCK"
+
+reversed_markers="$TEST_TMP/reversed-markers.rules"
+printf '*nat\n%s\n%s\nCOMMIT\n' "$NAT_END" "$NAT_BEGIN" > "$reversed_markers"
+assert_status 1 validate_nat_managed_section "$reversed_markers"
+BEFORE_RULES="$reversed_markers"
+assert_status 1 ensure_nat_managed_section >/dev/null 2>&1
+BEFORE_RULES="$nat_fixture"
 
 IPTABLES_RESTORE_FAIL=0
 IPTABLES_RESTORE_LOG="$TEST_TMP/iptables-restore.log"
@@ -201,19 +229,41 @@ UFW_ADD_COUNT=0
 UFW_FAIL_ADD_AT=0
 UFW_DELETE_COUNT=0
 UFW_FAIL_DELETE_AT=0
+UFW_SHOW_ADDED_OVERRIDE=
+UFW_RELOAD_SYNC=1
+LIVE_NAT_FILE="$TEST_TMP/live-nat.rules"
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 ufw() {
     local previous= argument number index
     case "$*" in
         'status') printf 'Status: active\n'; return 0 ;;
-        'reload') return 0 ;;
+        'reload')
+            (( UFW_RELOAD_SYNC == 0 )) || cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
+            return 0
+            ;;
         'status numbered')
-            local marker index=1
+            local marker proto index=1
             if (( ${#UFW_ADDED_MARKERS[@]} > 0 )); then
                 for marker in "${UFW_ADDED_MARKERS[@]}"; do
-                    printf '[ %d] route ALLOW %s\n' "$index" "$marker"
+                    proto=${marker##*:}
+                    printf '[ %d] 10.0.0.2 52350/%s on eth1 ALLOW FWD Anywhere on eth0 # %s\n' \
+                        "$index" "$proto" "$marker"
                     ((index += 1))
                 done
             fi
+            return 0
+            ;;
+        'show added')
+            if [[ -n "$UFW_SHOW_ADDED_OVERRIDE" ]]; then
+                printf '%s\n' "$UFW_SHOW_ADDED_OVERRIDE"
+                return 0
+            fi
+            local marker proto
+            for marker in "${UFW_ADDED_MARKERS[@]}"; do
+                proto=${marker##*:}
+                printf "ufw route allow in on eth0 out on eth1 proto %s from any to 10.0.0.2 port 52350 comment '%s'\n" \
+                    "$proto" "$marker"
+            done
             return 0
             ;;
     esac
@@ -246,13 +296,44 @@ ufw() {
     return 0
 }
 
+iptables-save() {
+    awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"
+}
+
+UFW_ADDED_MARKERS=('lsec:prefix:tcp' 'lsec:prefix:tcp-extra')
+UFW_DELETE_COUNT=0
+delete_ufw_rules_by_comment 'lsec:prefix:tcp'
+assert_eq "${#UFW_ADDED_MARKERS[@]}" 1
+assert_eq "${UFW_ADDED_MARKERS[0]}" 'lsec:prefix:tcp-extra'
+assert_status 1 delete_ufw_rules_by_comment 'lsec:prefix:tcp'
+UFW_ADDED_MARKERS=()
+UFW_DELETE_COUNT=0
+
 original_ipv4_apply="$(declare -f apply_ipv4_forwarding_for_transaction 2>/dev/null || true)"
+original_verify_ipv4="$(declare -f verify_ipv4_forwarding_effective)"
 apply_ipv4_forwarding_for_transaction() { return 0; }
+verify_ipv4_forwarding_effective() { return 0; }
 create_forwarding_transaction batch-success "$create_staged" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
 assert_file_contains "$BEFORE_RULES" 'lsec:batch-success:tcp:dnat'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:tcp\ttcp'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:udp\tudp'
 assert_file_contains "$TRANSACTION_DIR/batch-success.txn" $'phase\tcommitted'
+assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
+cp "$STATE_FILE" "$TEST_TMP/state-before-drift"
+sed 's/\t52350\teth1/\t52351\teth1/' "$TEST_TMP/state-before-drift" > "$STATE_FILE"
+assert_status 1 verify_nat_marker_effective 'lsec:batch-success:tcp'
+cp "$TEST_TMP/state-before-drift" "$STATE_FILE"
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.20 port 523500 comment 'lsec:batch-success:tcp'"
+assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+UFW_SHOW_ADDED_OVERRIDE=
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {gsub(/-p tcp/, "-p tcp -m tcp"); gsub(/-d 10.0.0.2/, "-d 10.0.0.2\/32"); print}' "$LIVE_NAT_FILE"; }
+assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
+iptables-save() { awk '/lsec:batch-success:tcp:dnat/ {print; print; next} /^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+assert_status 1 verify_nat_marker_effective 'lsec:batch-success:tcp'
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; printf '%s\n' '-A PREROUTING -p tcp --dport 9999 -j DNAT --to-destination 172.17.0.2:9999'; }
+assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 if [[ -n "$original_ipv4_apply" ]]; then
     eval "$original_ipv4_apply"
 else
@@ -332,6 +413,7 @@ prepare_create_failure_case() {
     : > "$IP_FORWARDING_STATE"
     FAILURE_STAGED="$TEST_TMP/${batch}-staged.rules"
     stage_forward_nat "$FAILURE_STAGED" "$batch" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp
+    cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
     FAILURE_BEFORE_HASH="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
     UFW_ADDED_MARKERS=()
     UFW_ADD_COUNT=0
@@ -367,6 +449,15 @@ assert_status "$RESULT_VERIFY_FAILED_ROLLED_BACK" create_forwarding_transaction 
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 0
 [[ ! -e "$STATE_VERSION_FILE" ]] || fail 'rollback left a state.version that did not exist before'
 eval "$original_verify_batch"
+eval "$original_ipv4_apply"
+
+prepare_create_failure_case batch-reload-noop
+apply_ipv4_forwarding_for_transaction() { return 0; }
+UFW_RELOAD_SYNC=0
+assert_status "$RESULT_VERIFY_FAILED_ROLLED_BACK" create_forwarding_transaction \
+    batch-reload-noop "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'reload no-op with verified rollback activated protected lock'
+UFW_RELOAD_SYNC=1
 eval "$original_ipv4_apply"
 
 original_restore_snapshot="$(declare -f restore_transaction_snapshot)"
@@ -415,10 +506,12 @@ stage_forward_nat "$TEST_TMP/delete-live.rules" old-batch any eth0 52350 eth1 10
 BEFORE_RULES="$TEST_TMP/delete-success-before.rules"
 cp "$TEST_TMP/delete-live.rules" "$BEFORE_RULES"
 mkdir -p "$STATE_DIR"
-render_state_with_forward_batch /dev/null old-batch any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+: > "$TEST_TMP/empty-current-state"
+render_state_with_forward_batch "$TEST_TMP/empty-current-state" old-batch any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
 printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
 : > "$IP_FORWARDING_STATE"
 UFW_ADDED_MARKERS=('lsec:old-batch:tcp' 'lsec:old-batch:udp')
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 UFW_DELETE_COUNT=0
 delete_staged="$TEST_TMP/delete-staged.rules"
 delete_live_hash="$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')"
@@ -439,10 +532,11 @@ stage_forward_nat "$TEST_TMP/delete-failure-live.rules" old-failure any eth0 523
 BEFORE_RULES="$TEST_TMP/delete-failure-before.rules"
 cp "$TEST_TMP/delete-failure-live.rules" "$BEFORE_RULES"
 mkdir -p "$STATE_DIR"
-render_state_with_forward_batch /dev/null old-failure any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+render_state_with_forward_batch "$TEST_TMP/empty-current-state" old-failure any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
 printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
 : > "$IP_FORWARDING_STATE"
 UFW_ADDED_MARKERS=('lsec:old-failure:tcp' 'lsec:old-failure:udp')
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 UFW_DELETE_COUNT=0
 UFW_FAIL_DELETE_AT=2
 delete_failure_staged="$TEST_TMP/delete-failure-staged.rules"
@@ -472,7 +566,7 @@ stage_forward_nat "$TEST_TMP/replace-live.rules" replace-old any eth0 52350 eth1
 BEFORE_RULES="$TEST_TMP/replace-success-before.rules"
 cp "$TEST_TMP/replace-live.rules" "$BEFORE_RULES"
 mkdir -p "$STATE_DIR"
-render_state_with_forward_batch /dev/null replace-old any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+render_state_with_forward_batch "$TEST_TMP/empty-current-state" replace-old any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
 printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
 : > "$IP_FORWARDING_STATE"
 assert_eq "$(find_parameter_collisions tcp any eth0 52350 eth1 10.0.0.2 52350 yes)" 'lsec:replace-old:tcp'
@@ -482,6 +576,7 @@ stage_forward_nat_replacement "$replace_staged" replace-new any eth0 52350 eth1 
 assert_not_contains "$(cat "$replace_staged")" 'lsec:replace-old:'
 assert_contains "$(cat "$replace_staged")" 'lsec:replace-new:tcp:dnat'
 UFW_ADDED_MARKERS=('lsec:replace-old:tcp' 'lsec:replace-old:udp')
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 UFW_ADD_COUNT=0
 UFW_DELETE_COUNT=0
 replace_forwarding_transaction replace-new "$replace_staged" \
@@ -508,13 +603,14 @@ stage_forward_nat "$TEST_TMP/replace-failure-live.rules" replace-restore any eth
 BEFORE_RULES="$TEST_TMP/replace-failure-before.rules"
 cp "$TEST_TMP/replace-failure-live.rules" "$BEFORE_RULES"
 mkdir -p "$STATE_DIR"
-render_state_with_forward_batch /dev/null replace-restore any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
+render_state_with_forward_batch "$TEST_TMP/empty-current-state" replace-restore any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp > "$STATE_FILE"
 printf '%s\n' "$STATE_SCHEMA_VERSION" > "$STATE_VERSION_FILE"
 : > "$IP_FORWARDING_STATE"
 replace_failure_staged="$TEST_TMP/replace-failure-staged.rules"
 stage_forward_nat_replacement "$replace_failure_staged" replace-fails any eth0 52350 eth1 10.0.0.2 52350 yes \
     'lsec:replace-restore:tcp,lsec:replace-restore:udp' tcp udp
 UFW_ADDED_MARKERS=('lsec:replace-restore:tcp' 'lsec:replace-restore:udp')
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 UFW_ADD_COUNT=0
 UFW_DELETE_COUNT=0
 UFW_FAIL_ADD_AT=1
@@ -528,6 +624,7 @@ assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:tcp'
 assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:udp'
 UFW_FAIL_ADD_AT=0
 
+eval "$original_verify_ipv4"
 assert_contains "$(declare -f ensure_ipv4_forwarding)" 'UFW_SYSCTL_FILE'
 
 STATE_DIR="$TEST_TMP/ipv4-state"
@@ -591,6 +688,8 @@ BOOT_UFW_ACTIVE=no
 BOOT_UFW_FAIL=
 BOOT_UFW_MARKERS=()
 BOOT_UFW_LOG="$TEST_TMP/ufw-bootstrap.log"
+original_confirm_ufw_activation="$(declare -f confirm_ufw_activation_after_ssh_check)"
+confirm_ufw_activation_after_ssh_check() { return 0; }
 ufw() {
     local previous= argument number index
     printf '%s\n' "$*" >> "$BOOT_UFW_LOG"
@@ -602,15 +701,29 @@ ufw() {
             printf 'Default: deny (incoming), allow (outgoing), deny (routed)\n'
             ;;
         'show added')
-            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then printf '%s\n' "${BOOT_UFW_MARKERS[@]}"; fi
+            if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then
+                for argument in "${BOOT_UFW_MARKERS[@]}"; do
+                    if [[ "$argument" == ufw-relay:* || "$argument" == lsec:*:legacy-* ]]; then
+                        printf "ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.2 port 80 comment '%s'\n" "$argument"
+                    else
+                        printf "ufw allow in proto tcp from any to any port 2222 comment '%s'\n" "$argument"
+                    fi
+                done
+            fi
             ;;
         'status numbered')
             if (( ${#BOOT_UFW_MARKERS[@]} > 0 )); then
                 for (( index=0; index<${#BOOT_UFW_MARKERS[@]}; index++ )); do
-                    printf '[ %d] ALLOW IN %s\n' "$((index + 1))" "${BOOT_UFW_MARKERS[$index]}"
+                    if [[ "${BOOT_UFW_MARKERS[$index]}" == ufw-relay:* || "${BOOT_UFW_MARKERS[$index]}" == lsec:*:legacy-* ]]; then
+                        printf '[ %d] 10.0.0.2 80/tcp on eth1 ALLOW FWD Anywhere on eth0 # %s\n' \
+                            "$((index + 1))" "${BOOT_UFW_MARKERS[$index]}"
+                    else
+                        printf '[ %d] ALLOW IN %s\n' "$((index + 1))" "${BOOT_UFW_MARKERS[$index]}"
+                    fi
                 done
             fi
             ;;
+        reload) cp "$BEFORE_RULES" "$LIVE_NAT_FILE" ;;
         '--force enable') BOOT_UFW_ACTIVE=yes ;;
         disable) BOOT_UFW_ACTIVE=no ;;
         '--force delete '*)
@@ -651,6 +764,15 @@ assert_eq "$BOOT_UFW_ACTIVE" no
 assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified UFW rollback created protected lock'
 BOOT_UFW_FAIL=
+eval "$original_confirm_ufw_activation"
+BOOT_UFW_MARKERS=('lsec:preview:ssh-2222')
+original_confirm_preview="$(declare -f confirm)"
+confirm() { return 1; }
+previewed_ufw_rules="$(confirm_ufw_activation_after_ssh_check 2222 2>/dev/null || true)"
+assert_contains "$previewed_ufw_rules" "ufw allow in proto tcp"
+assert_contains "$previewed_ufw_rules" 'Status:'
+eval "$original_confirm_preview"
+BOOT_UFW_MARKERS=()
 
 ufw_setup_definition="$(declare -f setup_and_enable_ufw_locked; declare -f setup_and_enable_ufw)"
 assert_contains "$ufw_setup_definition" 'resolve_ssh_ports_for_ufw'
@@ -687,11 +809,14 @@ printf 'legacy-id\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\n' > "$STATE_FILE
 rm -f "$STATE_VERSION_FILE"
 assert_status "$RESULT_REPAIR_REQUIRED" require_current_state_schema
 printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
-    '-A PREROUTING -p tcp --dport 80 -m comment --comment ufw-relay:legacy-id:dnat -j DNAT --to-destination 10.0.0.2:80' \
-    '-A POSTROUTING -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-id:snat -j MASQUERADE' \
+    '-A PREROUTING -i eth0 -p tcp --dport 80 -m comment --comment ufw-relay:legacy-id:dnat -j DNAT --to-destination 10.0.0.2:80' \
+    '-A POSTROUTING -o eth1 -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-id:snat -j MASQUERADE' \
     'COMMIT' > "$BEFORE_RULES"
 BOOT_UFW_MARKERS=('ufw-relay:legacy-id')
 assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-exact'
+sed -i.bak 's/-i eth0/-i eth9/' "$BEFORE_RULES"
+assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-drift'
+mv "$BEFORE_RULES.bak" "$BEFORE_RULES"
 printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
 assert_contains "$(audit_legacy_forwarding_state)" $'legacy-id\tlegacy-drift'
 : > "$STATE_FILE"
@@ -701,18 +826,41 @@ assert_contains "$(declare -f main)" 'startup_transaction_recovery'
 printf 'legacy-migrate\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\n' > "$STATE_FILE"
 rm -f "$STATE_VERSION_FILE"
 printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
-    '-A PREROUTING -p tcp --dport 80 -m comment --comment ufw-relay:legacy-migrate:dnat -j DNAT --to-destination 10.0.0.2:80' \
-    '-A POSTROUTING -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-migrate:snat -j MASQUERADE' \
+    '-A PREROUTING -i eth0 -p tcp --dport 80 -m comment --comment ufw-relay:legacy-migrate:dnat -j DNAT --to-destination 10.0.0.2:80' \
+    '-A POSTROUTING -o eth1 -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-migrate:snat -j MASQUERADE' \
     'COMMIT' > "$BEFORE_RULES"
 BOOT_UFW_MARKERS=('ufw-relay:legacy-migrate')
 BOOT_UFW_ACTIVE=yes
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
+original_verify_ipv4_migration="$(declare -f verify_ipv4_forwarding_effective)"
+verify_ipv4_forwarding_effective() { return 0; }
 migrate_legacy_forwarding_state migration-batch
+eval "$original_verify_ipv4_migration"
 assert_eq "$(state_marker_count 'lsec:migration-batch:legacy-1')" 1
 assert_file_contains "$BEFORE_RULES" 'lsec:migration-batch:legacy-1:dnat'
 assert_contains "${BOOT_UFW_MARKERS[*]}" 'lsec:migration-batch:legacy-1'
 assert_file_contains "$STATE_VERSION_FILE" "$STATE_SCHEMA_VERSION"
 assert_file_contains "$TRANSACTION_DIR/migration-batch.txn" $'phase\tcommitted'
 assert_contains "$(declare -f forward_menu)" 'legacy_state_management_interactive'
+
+printf 'legacy-fail\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\n' > "$STATE_FILE"
+rm -f "$STATE_VERSION_FILE"
+printf '%s\n' '*nat' ':PREROUTING ACCEPT [0:0]' \
+    '-A PREROUTING -i eth0 -p tcp --dport 80 -m comment --comment ufw-relay:legacy-fail:dnat -j DNAT --to-destination 10.0.0.2:80' \
+    '-A POSTROUTING -o eth1 -p tcp -d 10.0.0.2 --dport 80 -m comment --comment ufw-relay:legacy-fail:snat -j MASQUERADE' \
+    'COMMIT' > "$BEFORE_RULES"
+cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
+BOOT_UFW_MARKERS=('ufw-relay:legacy-fail')
+original_add_forward_ufw_route="$(declare -f add_forward_ufw_route)"
+add_forward_ufw_route() {
+    [[ "$7" != lsec:* ]] || return 1
+    ufw route allow in on "$3" out on "$4" proto "$1" from "$2" to "$5" port "$6" comment "$7"
+}
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" migrate_legacy_forwarding_state migration-fail >/dev/null 2>&1
+assert_contains "${BOOT_UFW_MARKERS[*]}" 'ufw-relay:legacy-fail'
+assert_not_contains "${BOOT_UFW_MARKERS[*]}" 'lsec:migration-fail:'
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified legacy rollback activated protected lock'
+eval "$original_add_forward_ufw_route"
 
 STATE_DIR="$TEST_TMP/backup-policy-state"
 configure_state_paths
@@ -733,6 +881,12 @@ assert_contains "$eligible_backups" 'backup-01'
 assert_contains "$eligible_backups" 'backup-02'
 assert_not_contains "$eligible_backups" 'backup-03'
 assert_not_contains "$eligible_backups" 'backup-failed'
+printf 'owner_snapshot\t%s\n' "$BACKUP_DIR/backup-01" > "$IP_FORWARDING_STATE"
+assert_not_contains "$(eligible_success_snapshots_for_cleanup 4000000)" 'backup-01'
+: > "$IP_FORWARDING_STATE"
+printf 'lsec:backup-02:tcp\ttcp\tany\teth0\t80\teth1\t10.0.0.2\t80\tyes\tbackup-02\n' > "$STATE_FILE"
+assert_not_contains "$(eligible_success_snapshots_for_cleanup 4000000)" 'backup-02'
+: > "$STATE_FILE"
 assert_contains "$(list_snapshots)" $'backup-failed\tfailed'
 
 diagnostic_export="$TEST_TMP/lsec-diagnostics.txt"
@@ -744,6 +898,11 @@ cleanup_selected_snapshots 4000000 backup-01
 [[ ! -e "$BACKUP_DIR/backup-01" ]] || fail 'eligible selected backup was not removed'
 assert_status "$RESULT_PRECHECK_FAILED" cleanup_selected_snapshots 4000000 backup-03 >/dev/null 2>&1
 [[ -d "$BACKUP_DIR/backup-03" ]] || fail 'protected newest-20 backup was removed'
+printf 'batch_id\tprotected-cleanup\n' > "$PROTECTED_LOCK"
+assert_status "$RESULT_PROTECTED_LOCKOUT" cleanup_selected_snapshots 4000000 backup-02 >/dev/null 2>&1
+[[ -d "$BACKUP_DIR/backup-02" ]] || fail 'cleanup ran while protected lock was active'
+assert_status 0 require_recovery_allowed restore
+rm -f "$PROTECTED_LOCK"
 assert_status "$RESULT_PRECHECK_FAILED" cleanup_selected_snapshots 4000000 '../escape' >/dev/null 2>&1
 
 STATE_DIR="$TEST_TMP/restore-state"
@@ -770,5 +929,27 @@ assert_contains "$(declare -f ssh_management_menu)" 'run_mutation_action'
 assert_contains "$(declare -f fail2ban_management_menu)" 'run_mutation_action'
 assert_contains "$(declare -f inbound_menu)" 'run_mutation_action'
 assert_contains "$(declare -f outbound_menu)" 'run_mutation_action'
+
+STATE_DIR="$TEST_TMP/nat-reconcile-state"
+configure_state_paths
+mkdir -p "$STATE_DIR"
+BEFORE_RULES="$TEST_TMP/nat-reconcile-before.rules"
+printf '*filter\nCOMMIT\n' > "$BEFORE_RULES"
+: > "$STATE_FILE"
+write_protected_record nat-structure repair_required marker-drift > "$PROTECTED_LOCK"
+attempt_protected_repair
+[[ ! -e "$PROTECTED_LOCK" ]] || fail 'reconciled NAT structure lock was not cleared'
+
+DOC_README="$TEST_ROOT/README.md"
+DOC_RECOVERY="$TEST_ROOT/docs/forwarding-transaction-recovery.md"
+assert_file_contains "$DOC_README" '原子事务'
+assert_file_contains "$DOC_README" 'docs/forwarding-transaction-recovery.md'
+assert_file_contains "$DOC_RECOVERY" 'UDP 52350'
+assert_file_contains "$DOC_RECOVERY" 'TCP 52351'
+assert_file_contains "$DOC_RECOVERY" 'HY2'
+assert_file_contains "$DOC_RECOVERY" 'VLESS'
+assert_file_contains "$DOC_RECOVERY" '保护锁'
+assert_file_contains "$DOC_RECOVERY" '仅运行前置检查'
+assert_file_contains "$DOC_RECOVERY" '本机验证不等于端到端协议可达'
 
 printf 'linux security transaction test passed\n'

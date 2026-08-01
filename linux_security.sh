@@ -7,7 +7,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 PROGRAM_NAME="Linux 服务器安全防护管理器"
-VERSION="3.3.0"
+VERSION="4.0.0"
 INSTALL_PATH=/usr/local/bin/lsec
 unset REMOTE_URL
 readonly REMOTE_URL=https://raw.githubusercontent.com/jilinker/shells/main/linux_security.sh
@@ -62,7 +62,7 @@ readonly MUTATION_LOCK_FD=9
 readonly STATE_SCHEMA_VERSION=2
 MUTATION_LOCK_HELD=0
 MISSING_DEPENDENCIES=()
-readonly FORWARD_DEPENDENCIES='flock ufw iptables iptables-restore sysctl'
+readonly FORWARD_DEPENDENCIES='flock ufw iptables iptables-save iptables-restore sysctl'
 readonly UFW_RISK_CONFIRMATION='我确认SSH端口已放行并承担断连风险'
 
 configure_state_paths() {
@@ -136,6 +136,7 @@ run_mutation_action() {
 begin_mutation() {
     local operation=${1:-未命名操作}
 
+    bootstrap_flock_dependency || return $?
     if (( MUTATION_LOCK_HELD == 1 )); then
         error "当前进程已经持有全局变更锁"
         return "$RESULT_PRECHECK_FAILED"
@@ -144,12 +145,12 @@ begin_mutation() {
         error "无法创建状态目录：${STATE_DIR}"
         return "$RESULT_PRECHECK_FAILED"
     fi
-    if ! eval "exec ${MUTATION_LOCK_FD}>\"${OPERATION_LOCK}\""; then
+    if ! exec 9>"$OPERATION_LOCK"; then
         error "无法打开全局变更锁：${OPERATION_LOCK}"
         return "$RESULT_PRECHECK_FAILED"
     fi
     if ! flock -n "$MUTATION_LOCK_FD"; then
-        eval "exec ${MUTATION_LOCK_FD}>&-"
+        exec 9>&-
         warn "已有其他 lsec 变更正在执行"
         [[ -s "$OPERATION_LOCK" ]] && sed -n '1,3p' "$OPERATION_LOCK" >&2
         return "$RESULT_PRECHECK_FAILED"
@@ -163,16 +164,70 @@ begin_mutation() {
     fi
 }
 
+# flock 是取得全局锁本身所需的唯一引导依赖；安装完成后仍从完整锁流程继续。
+bootstrap_flock_dependency() {
+    local bootstrap_lock="${STATE_DIR}/.flock-bootstrap"
+    dependency_available flock && return "$RESULT_OK"
+    [[ ! -s "$PROTECTED_LOCK" ]] || return "$RESULT_PROTECTED_LOCKOUT"
+    install -d -m 700 "$STATE_DIR" || return "$RESULT_PRECHECK_FAILED"
+    if ! mkdir "$bootstrap_lock" 2>/dev/null; then
+        local stale_pid
+        stale_pid=$(cat "$bootstrap_lock/owner-pid" 2>/dev/null || true)
+        if [[ "$stale_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$stale_pid" 2>/dev/null; then
+            warn "检测到已退出进程 ${stale_pid} 遗留的 flock 引导锁"
+            if confirm "是否清理该 stale 引导锁并继续？" N; then
+                rm -f -- "$bootstrap_lock/owner-pid" \
+                    && rmdir "$bootstrap_lock" \
+                    && mkdir "$bootstrap_lock" || return "$RESULT_PRECHECK_FAILED"
+            else
+                return "$RESULT_CANCELLED"
+            fi
+        else
+            error "另一个 flock 引导安装正在执行"
+            return "$RESULT_PRECHECK_FAILED"
+        fi
+    fi
+    printf '%s\n' "$$" > "$bootstrap_lock/owner-pid" || {
+        rmdir "$bootstrap_lock" 2>/dev/null || true
+        return "$RESULT_PRECHECK_FAILED"
+    }
+    MISSING_DEPENDENCIES=(flock)
+    warn "缺少全局事务锁组件 flock，尚未执行任何受管变更"
+    if ! confirm "是否自动安装 flock（util-linux）后继续？" N; then
+        MISSING_DEPENDENCIES=()
+        cleanup_bootstrap_lock_if_owned
+        return "$RESULT_CANCELLED"
+    fi
+    if ! install_missing_dependencies || ! dependency_available flock; then
+        MISSING_DEPENDENCIES=()
+        cleanup_bootstrap_lock_if_owned
+        error "flock 安装失败，无法安全继续"
+        return "$RESULT_PRECHECK_FAILED"
+    fi
+    MISSING_DEPENDENCIES=()
+    cleanup_bootstrap_lock_if_owned
+    return "$RESULT_OK"
+}
+
+cleanup_bootstrap_lock_if_owned() {
+    local bootstrap_lock="${STATE_DIR}/.flock-bootstrap"
+    [[ -f "$bootstrap_lock/owner-pid" ]] || return 0
+    [[ $(cat "$bootstrap_lock/owner-pid" 2>/dev/null) == "$$" ]] || return 0
+    rm -f -- "$bootstrap_lock/owner-pid" || return 1
+    rmdir "$bootstrap_lock" 2>/dev/null || true
+}
+
 end_mutation() {
     (( MUTATION_LOCK_HELD == 1 )) || return 0
     : > "$OPERATION_LOCK" || true
     flock -u "$MUTATION_LOCK_FD" || true
-    eval "exec ${MUTATION_LOCK_FD}>&-"
+    exec 9>&-
     MUTATION_LOCK_HELD=0
 }
 
 end_mutation_if_held() {
     end_mutation
+    cleanup_bootstrap_lock_if_owned || true
 }
 
 mutation_signal_exit() {
@@ -197,6 +252,13 @@ require_mutation_allowed() {
     return "$RESULT_OK"
 }
 
+require_recovery_allowed() {
+    case ${1:-} in
+        restore|repair|reconcile) return "$RESULT_OK" ;;
+        *) require_mutation_allowed ;;
+    esac
+}
+
 require_current_state_schema() {
     [[ -s "$STATE_FILE" ]] || return "$RESULT_OK"
     if [[ -f "$STATE_VERSION_FILE" && $(cat "$STATE_VERSION_FILE" 2>/dev/null) == "$STATE_SCHEMA_VERSION" ]]; then
@@ -207,9 +269,7 @@ require_current_state_schema() {
 
 audit_legacy_forwarding_state() {
     local marker proto source in_if public_port out_if landing_ip landing_port masquerade batch extra status
-    local nat_dnat nat_snat ufw_count ufw_status
     [[ -f "$STATE_FILE" ]] || return 0
-    ufw_status=$(ufw status numbered 2>/dev/null || true)
     while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch extra; do
         [[ -n "$marker" ]] || continue
         status=malformed
@@ -222,12 +282,10 @@ audit_legacy_forwarding_state() {
             elif [[ -z "$batch" ]]; then
                 status=legacy-drift
                 if [[ "$marker" =~ ^[A-Za-z0-9._-]+$ ]]; then
-                    nat_dnat=$(awk -v tag="ufw-relay:${marker}:dnat" 'index($0, tag) {count++} END {print count + 0}' "$BEFORE_RULES")
-                    nat_snat=$(awk -v tag="ufw-relay:${marker}:snat" 'index($0, tag) {count++} END {print count + 0}' "$BEFORE_RULES")
-                    ufw_count=$(awk -v tag="ufw-relay:${marker}" 'index($0, tag) {count++} END {print count + 0}' <<< "$ufw_status")
-                    if (( nat_dnat == 1 && ufw_count == 1 )) \
-                        && { [[ "$masquerade" == no && "$nat_snat" == 0 ]] \
-                            || [[ "$masquerade" == yes && "$nat_snat" == 1 ]]; }; then
+                    if verify_legacy_nat_definition "$marker" "$proto" "$source" "$in_if" \
+                        "$public_port" "$out_if" "$landing_ip" "$landing_port" "$masquerade" \
+                        && verify_ufw_route_definition "ufw-relay:${marker}" "$proto" "$source" \
+                            "$in_if" "$out_if" "$landing_ip" "$landing_port"; then
                         status=legacy-exact
                     fi
                 fi
@@ -235,6 +293,25 @@ audit_legacy_forwarding_state() {
         fi
         printf '%s\t%s\n' "$marker" "$status"
     done < "$STATE_FILE"
+}
+
+verify_legacy_nat_definition() {
+    local id=$1 proto=$2 source=$3 in_if=$4 public_port=$5 out_if=$6 landing_ip=$7 landing_port=$8 masquerade=$9
+    local source_match expected_dnat expected_snat actual_dnat actual_snat
+    source_match=
+    [[ "$source" != any ]] && source_match="-s ${source} "
+    expected_dnat="-A PREROUTING -i ${in_if} -p ${proto} ${source_match}--dport ${public_port} -m comment --comment ufw-relay:${id}:dnat -j DNAT --to-destination ${landing_ip}:${landing_port}"
+    expected_snat="-A POSTROUTING -o ${out_if} -p ${proto} -d ${landing_ip} --dport ${landing_port} -m comment --comment ufw-relay:${id}:snat -j MASQUERADE"
+    expected_dnat=$(printf '%s\n' "$expected_dnat" | normalize_iptables_rule)
+    expected_snat=$(printf '%s\n' "$expected_snat" | normalize_iptables_rule)
+    actual_dnat=$(awk -v tag="--comment ufw-relay:${id}:dnat" 'index($0, tag) {print}' "$BEFORE_RULES" | normalize_iptables_rule) || return 1
+    actual_snat=$(awk -v tag="--comment ufw-relay:${id}:snat" 'index($0, tag) {print}' "$BEFORE_RULES" | normalize_iptables_rule) || return 1
+    [[ "$actual_dnat" == "$expected_dnat" ]] || return 1
+    if [[ "$masquerade" == yes ]]; then
+        [[ "$actual_snat" == "$expected_snat" ]]
+    else
+        [[ -z "$actual_snat" ]]
+    fi
 }
 
 render_legacy_migration_mapping() {
@@ -285,10 +362,22 @@ render_migrated_forwarding_state() {
 restore_legacy_ufw_rules() {
     local mapping=$1 old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
     while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
-        if ! ufw status numbered 2>/dev/null | grep -Fq -- "ufw-relay:${old_id}"; then
+        if ufw_marker_present "ufw-relay:${old_id}"; then
+            verify_ufw_route_definition "ufw-relay:${old_id}" "$proto" "$source" \
+                "$in_if" "$out_if" "$landing_ip" "$landing_port" || return 1
+        else
             add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" \
                 "$landing_ip" "$landing_port" "ufw-relay:${old_id}" || return 1
         fi
+    done < "$mapping"
+    verify_legacy_ufw_mapping "$mapping"
+}
+
+verify_legacy_ufw_mapping() {
+    local mapping=$1 old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
+        verify_ufw_route_definition "ufw-relay:${old_id}" "$proto" "$source" \
+            "$in_if" "$out_if" "$landing_ip" "$landing_port" || return 1
     done < "$mapping"
 }
 
@@ -299,6 +388,7 @@ rollback_legacy_migration() {
     restore_legacy_ufw_rules "$mapping" || result=1
     reload_ufw || result=1
     verify_snapshot_restored "$batch_id" || result=1
+    verify_legacy_ufw_mapping "$mapping" || result=1
     if (( result == 0 )); then
         set_transaction_phase "$batch_id" rolled_back
         return 0
@@ -310,6 +400,7 @@ rollback_legacy_migration() {
 migrate_legacy_forwarding_state() {
     local batch_id=$1 audit mapping staged
     local old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    local expected_count processed_count=0
     audit=$(audit_legacy_forwarding_state)
     [[ -n "$audit" ]] || return "$RESULT_PRECHECK_FAILED"
     if awk -F '\t' '$2 != "legacy-exact" {bad=1} END {exit bad ? 0 : 1}' <<< "$audit"; then
@@ -334,24 +425,28 @@ migrate_legacy_forwarding_state() {
         rollback_legacy_migration "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
         return "$RESULT_APPLY_FAILED_ROLLED_BACK"
     }
+    expected_count=$(awk 'NF {count++} END {print count + 0}' "$mapping")
     if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
         && set_transaction_phase "$batch_id" applying_ufw; then
         while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
             if record_intended_ufw_marker "$batch_id" "$marker" \
+                && verify_ufw_route_definition "ufw-relay:${old_id}" "$proto" "$source" \
+                    "$in_if" "$out_if" "$landing_ip" "$landing_port" \
                 && delete_ufw_rules_by_comment "ufw-relay:${old_id}" \
                 && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" "$landing_ip" "$landing_port" "$marker" \
                 && record_added_ufw_marker "$batch_id" "$marker"; then
-                :
+                ((processed_count += 1))
             else
                 break
             fi
         done < "$mapping"
-        if set_transaction_phase "$batch_id" committing_state \
+        if (( processed_count == expected_count )) \
+            && set_transaction_phase "$batch_id" committing_state \
             && atomic_write "$STATE_FILE" render_migrated_forwarding_state "$mapping" \
             && atomic_write "$STATE_VERSION_FILE" write_state_schema_version \
             && reload_ufw \
             && set_transaction_phase "$batch_id" verifying \
-            && [[ $(audit_legacy_forwarding_state | awk -F '\t' '$2 == "current" {count++} END {print count + 0}') -gt 0 ]]; then
+            && verify_migrated_mapping "$mapping"; then
             set_transaction_phase "$batch_id" verified \
                 && finish_transaction "$batch_id" committed \
                 && { rm -f -- "$mapping" "$staged"; return "$RESULT_OK"; }
@@ -362,6 +457,15 @@ migrate_legacy_forwarding_state() {
         return "$RESULT_APPLY_FAILED_ROLLED_BACK"
     fi
     return "$RESULT_ROLLBACK_FAILED"
+}
+
+verify_migrated_mapping() {
+    local mapping=$1 old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade
+    is_ufw_active || return 1
+    verify_ipv4_forwarding_effective || return 1
+    while IFS=$'\t' read -r old_id marker proto source in_if public_port out_if landing_ip landing_port masquerade; do
+        verify_managed_rule_identity "$marker" || return 1
+    done < "$mapping"
 }
 
 scan_incomplete_transactions() {
@@ -606,17 +710,44 @@ list_snapshots() {
 }
 
 eligible_success_snapshots_for_cleanup() {
-    local now_epoch=${1:-$(date +%s)}
-    list_snapshots \
+    local now_epoch=${1:-$(date +%s)} batch_id
+    while IFS= read -r batch_id; do
+        snapshot_is_referenced "$batch_id" || printf '%s\n' "$batch_id"
+    done < <(list_snapshots \
         | awk -F '\t' '$2 == "success" {print $3 "\t" $1}' \
         | sort -t $'\t' -k1,1nr \
-        | awk -F '\t' -v now="$now_epoch" 'NR > 20 && now - $1 > 2592000 {print $2}'
+        | awk -F '\t' -v now="$now_epoch" 'NR > 20 && now - $1 > 2592000 {print $2}')
+}
+
+snapshot_is_referenced() {
+    local batch_id=$1 owner_snapshot journal snapshot phase protected_batch
+    if [[ -s "$IP_FORWARDING_STATE" ]]; then
+        owner_snapshot=$(transaction_value "$IP_FORWARDING_STATE" owner_snapshot 2>/dev/null || true)
+        [[ ${owner_snapshot##*/} == "$batch_id" ]] && return 0
+    fi
+    if [[ -s "$STATE_FILE" ]] \
+        && awk -F '\t' -v batch_id="$batch_id" '$10 == batch_id {found=1} END {exit found ? 0 : 1}' "$STATE_FILE"; then
+        return 0
+    fi
+    for journal in "$TRANSACTION_DIR"/*.txn; do
+        [[ -f "$journal" ]] || continue
+        phase=$(transaction_value "$journal" phase 2>/dev/null || true)
+        case "$phase" in committed|rolled_back) continue ;; esac
+        snapshot=$(transaction_value "$journal" snapshot 2>/dev/null || true)
+        [[ ${snapshot##*/} == "$batch_id" ]] && return 0
+    done
+    if [[ -s "$PROTECTED_LOCK" ]]; then
+        protected_batch=$(transaction_value "$PROTECTED_LOCK" batch_id 2>/dev/null || true)
+        [[ "$protected_batch" == "$batch_id" ]] && return 0
+    fi
+    return 1
 }
 
 cleanup_selected_snapshots() {
     local now_epoch=$1 batch_id eligible
     shift
     local -a selected=("$@")
+    require_mutation_allowed || return $?
     (( ${#selected[@]} > 0 )) || return "$RESULT_CANCELLED"
     eligible=$(eligible_success_snapshots_for_cleanup "$now_epoch")
     for batch_id in "${selected[@]}"; do
@@ -656,6 +787,7 @@ restore_snapshot_transaction() {
         while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
             [[ -n "$marker" ]] || continue
             if ! awk -F '\t' -v marker="$marker" '$1 == marker {found=1} END {exit found ? 0 : 1}' "$target_state"; then
+                verify_managed_rule_identity "$marker" || { result=1; break; }
                 current_row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                     "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
                     "$landing_ip" "$landing_port" "$masquerade" "$original_batch")
@@ -668,7 +800,10 @@ restore_snapshot_transaction() {
     if (( result == 0 )); then
         while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
             [[ -n "$marker" ]] || continue
-            if ! ufw_marker_present "$marker"; then
+            if ufw_marker_present "$marker"; then
+                verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
+                    "$landing_ip" "$landing_port" || { result=1; break; }
+            else
                 record_intended_ufw_marker "$restore_batch" "$marker" \
                     && add_forward_ufw_route "$proto" "$source" "$in_if" "$out_if" "$landing_ip" "$landing_port" "$marker" \
                     && record_added_ufw_marker "$restore_batch" "$marker" \
@@ -678,11 +813,17 @@ restore_snapshot_transaction() {
     fi
 
     if (( result == 0 )) && restore_transaction_snapshot "$target_batch" \
-        && verify_snapshot_restored "$target_batch"; then
+        && verify_snapshot_restored "$target_batch" && is_ufw_active; then
         while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
             [[ -n "$marker" ]] || continue
-            ufw_marker_present "$marker" || { result=1; break; }
+            verify_nat_marker_effective "$marker" \
+                && verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
+                    "$landing_ip" "$landing_port" \
+                || { result=1; break; }
         done < "$target_state"
+        if [[ -s "$target_state" ]]; then
+            verify_ipv4_forwarding_effective || result=1
+        fi
     else
         result=1
     fi
@@ -742,7 +883,7 @@ missing_dependency_packages() {
         case "$dependency" in
             flock) package=util-linux ;;
             ufw) package=ufw ;;
-            iptables|iptables-restore) package=iptables ;;
+            iptables|iptables-save|iptables-restore) package=iptables ;;
             sysctl) package=procps ;;
             *) return 1 ;;
         esac
@@ -2220,7 +2361,8 @@ enable_ufw_transaction() {
     begin_transaction "$batch_id" enable_ufw "$(IFS=,; echo "${ssh_ports[*]}")" \
         || return "$RESULT_PRECHECK_FAILED"
     snapshot_ufw_bootstrap "$batch_id" || {
-        rollback_ufw_bootstrap "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+        set_transaction_phase "$batch_id" rolled_back 'UFW 初始化快照不完整，未执行变更' || true
+        set_snapshot_status "$batch_id" failed || true
         return "$RESULT_PRECHECK_FAILED"
     }
     if set_transaction_phase "$batch_id" applying_ufw \
@@ -2238,6 +2380,7 @@ enable_ufw_transaction() {
             fi
         done
         if verify_ufw_bootstrap_markers "$batch_id" "${ssh_ports[@]}" \
+            && confirm_ufw_activation_after_ssh_check "${ssh_ports[@]}" \
             && ufw --force enable \
             && ufw logging low \
             && is_ufw_active \
@@ -2251,6 +2394,14 @@ enable_ufw_transaction() {
         return "$failure_result"
     fi
     return "$RESULT_ROLLBACK_FAILED"
+}
+
+confirm_ufw_activation_after_ssh_check() {
+    local ports=("$@")
+    warn "SSH 放行规则已写入并验证，下一步将启用 UFW；当前 SSH 端口：${ports[*]}"
+    ufw show added || return 1
+    ufw status verbose || return 1
+    confirm "确认现在启用 UFW？" N
 }
 
 setup_and_enable_ufw_locked() {
@@ -2371,13 +2522,25 @@ backup_before_rules() {
 }
 
 ensure_nat_managed_section() {
-    local tmp tmp2 nat_block need_pre=0 need_post=0
+    local tmp tmp2 nat_block need_pre=0 need_post=0 nat_table_count
     tmp=$(mktemp)
     tmp2=$(mktemp)
 
-    if grep -Fq "$NAT_BEGIN" "$BEFORE_RULES" && grep -Fq "$NAT_END" "$BEFORE_RULES"; then
+    if validate_nat_managed_section "$BEFORE_RULES"; then
         rm -f "$tmp" "$tmp2"
         return 0
+    fi
+    if nat_managed_markers_present "$BEFORE_RULES"; then
+        rm -f "$tmp" "$tmp2"
+        error "NAT 受管区标记重复、错序或不在唯一的 *nat 表内"
+        protect_nat_structure_drift || true
+        return 1
+    fi
+    nat_table_count=$(awk '/^\*nat[[:space:]]*$/ {count++} END {print count + 0}' "$BEFORE_RULES")
+    if (( nat_table_count > 1 )); then
+        rm -f "$tmp" "$tmp2"
+        error "检测到多个 *nat 表，拒绝自动插入受管区"
+        return 1
     fi
 
     if grep -Eq '^\*nat[[:space:]]*$' "$BEFORE_RULES"; then
@@ -2427,6 +2590,40 @@ ensure_nat_managed_section() {
 
     install -m 640 "$tmp2" "$BEFORE_RULES"
     rm -f "$tmp" "$tmp2"
+}
+
+protect_nat_structure_drift() {
+    install -d -m 700 "$STATE_DIR" || return 1
+    atomic_write "$PROTECTED_LOCK" write_protected_record nat-structure repair_required \
+        'NAT 受管区标记重复、错序或位置无效'
+}
+
+# 有标记时，必须恰好存在一对有序标记，且位于唯一的 *nat/COMMIT 区间内。
+validate_nat_managed_section() {
+    local file=$1
+    awk -v begin="$NAT_BEGIN" -v end="$NAT_END" '
+        /^\*nat[[:space:]]*$/ {nat_tables++; in_nat=1; nat_closed=0; next}
+        in_nat && /^COMMIT[[:space:]]*$/ {in_nat=0; next}
+        $0 == begin {
+            begins++
+            if (!in_nat || ends > 0) invalid=1
+            begin_seen=1
+            next
+        }
+        $0 == end {
+            ends++
+            if (!in_nat || !begin_seen || ends > begins) invalid=1
+            next
+        }
+        END {
+            exit !(nat_tables == 1 && begins == 1 && ends == 1 && !invalid)
+        }
+    ' "$file"
+}
+
+nat_managed_markers_present() {
+    local file=$1
+    grep -Fq -e "$NAT_BEGIN" -e "$NAT_END" "$file"
 }
 
 # 在临时副本中生成整个转发批次，不修改正在使用的 before.rules。
@@ -2497,12 +2694,13 @@ render_state_with_forward_batch() {
     shift 9
     local proto marker
 
-    [[ -f "$current_state" ]] && cat "$current_state"
+    [[ -f "$current_state" ]] || return 1
+    cat "$current_state" || return 1
     for proto in "$@"; do
         marker=$(managed_marker "$batch_id" "$proto")
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
-            "$landing_ip" "$landing_port" "$masquerade" "$batch_id"
+            "$landing_ip" "$landing_port" "$masquerade" "$batch_id" || return 1
     done
 }
 
@@ -2643,14 +2841,101 @@ restore_owned_ipv4_forwarding() {
 verify_forwarding_batch() {
     local batch_id=$1
     shift
-    local proto marker ufw_status
-    ufw_status=$(ufw status numbered 2>/dev/null) || return 1
+    local proto marker
+    is_ufw_active || return 1
+    verify_ipv4_forwarding_effective || return 1
     for proto in "$@"; do
         marker=$(managed_marker "$batch_id" "$proto")
-        grep -Fq -- "--comment ${marker}:dnat" "$BEFORE_RULES" || return 1
         state_has_unique_marker "$marker" || return 1
-        grep -Fq -- "$marker" <<< "$ufw_status" || return 1
+        verify_nat_marker_effective "$marker" || return 1
+        verify_ufw_marker_effective "$marker" || return 1
     done
+}
+
+normalize_iptables_rule() {
+    sed -E 's/--comment "([^"]+)"/--comment \1/g; s/ -m (tcp|udp)( |$)/ /g; s/(-[sd] [0-9.]+)\/32([[:space:]]|$)/\1\2/g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+verify_nat_marker_effective() {
+    local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch
+    local expected_dnat expected_snat live_nat dnat_count snat_count
+    row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print}' "$STATE_FILE") || return 1
+    [[ $(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}') == 1 ]] || return 1
+    IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch <<< "$row"
+    expected_dnat=$(render_expected_dnat_rule "$marker" "$proto" "$source" "$in_if" \
+        "$public_port" "$landing_ip" "$landing_port" | normalize_iptables_rule) || return 1
+    expected_snat=$(render_expected_snat_rule "$marker" "$proto" "$out_if" \
+        "$landing_ip" "$landing_port" | normalize_iptables_rule) || return 1
+    [[ $(awk -v tag="--comment ${marker}:dnat" 'index($0, tag) {print}' "$BEFORE_RULES" \
+        | normalize_iptables_rule) == "$expected_dnat" ]] || return 1
+    local persisted_snat
+    persisted_snat=$(awk -v tag="--comment ${marker}:snat" 'index($0, tag) {print}' "$BEFORE_RULES" \
+        | normalize_iptables_rule) || return 1
+    if [[ "$masquerade" == yes ]]; then
+        [[ "$persisted_snat" == "$expected_snat" ]] || return 1
+    else
+        [[ -z "$persisted_snat" ]] || return 1
+    fi
+    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
+    dnat_count=$(awk -v expected="$expected_dnat" '$0 == expected {count++} END {print count + 0}' <<< "$live_nat")
+    [[ "$dnat_count" == 1 ]] || return 1
+    snat_count=$(awk -v marker="${marker}:snat" 'index($0, "--comment " marker) {count++} END {print count + 0}' <<< "$live_nat")
+    if [[ "$masquerade" == yes ]]; then
+        [[ "$snat_count" == 1 ]] || return 1
+        grep -qxF -- "$expected_snat" <<< "$live_nat" || return 1
+    else
+        [[ "$snat_count" == 0 ]] || return 1
+    fi
+}
+
+render_expected_dnat_rule() {
+    local marker=$1 proto=$2 source=$3 in_if=$4 public_port=$5 landing_ip=$6 landing_port=$7
+    local source_match=
+    [[ "$source" != any ]] && source_match="-s ${source} "
+    printf '%s\n' "-A PREROUTING -i ${in_if} -p ${proto} ${source_match}--dport ${public_port} -m comment --comment ${marker}:dnat -j DNAT --to-destination ${landing_ip}:${landing_port}"
+}
+
+render_expected_snat_rule() {
+    local marker=$1 proto=$2 out_if=$3 landing_ip=$4 landing_port=$5
+    printf '%s\n' "-A POSTROUTING -o ${out_if} -p ${proto} -d ${landing_ip} --dport ${landing_port} -m comment --comment ${marker}:snat -j MASQUERADE"
+}
+
+ufw_numbered_lines_for_marker() {
+    local marker=$1
+    ufw status numbered 2>/dev/null | awk -v marker="$marker" '$NF == marker {print}'
+}
+
+verify_ufw_marker_effective() {
+    local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch line
+    row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print}' "$STATE_FILE") || return 1
+    [[ $(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}') == 1 ]] || return 1
+    IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch <<< "$row"
+    verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
+        "$landing_ip" "$landing_port"
+}
+
+verify_ufw_route_definition() {
+    local marker=$1 proto=$2 source=$3 in_if=$4 out_if=$5 landing_ip=$6 landing_port=$7
+    local expected added
+    expected="ufw route allow in on ${in_if} out on ${out_if} proto ${proto} from ${source} to ${landing_ip} port ${landing_port} comment ${marker}"
+    added=$(ufw show added 2>/dev/null | normalize_ufw_added_rule) || return 1
+    [[ $(awk -v expected="$expected" '$0 == expected {count++} END {print count + 0}' <<< "$added") == 1 ]]
+}
+
+normalize_ufw_added_rule() {
+    sed -E "s/comment ['\"]([^'\"]+)['\"]/comment \\1/g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
+}
+
+verify_managed_rule_identity() {
+    local marker=$1
+    state_has_unique_marker "$marker" || return 1
+    verify_nat_marker_effective "$marker" || return 1
+    verify_ufw_marker_effective "$marker"
+}
+
+verify_ipv4_forwarding_effective() {
+    [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]] \
+        && [[ $(persistent_ipv4_forwarding_value) == 1 ]]
 }
 
 restore_transaction_snapshot() {
@@ -2696,29 +2981,41 @@ verify_snapshot_restored() {
     fi
     runtime_value=$(cat "$snapshot/runtime-ip-forward") || return 1
     if [[ "$runtime_value" == 0 || "$runtime_value" == 1 ]]; then
-        [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == "$runtime_value" ]]
+        [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == "$runtime_value" ]] || return 1
     fi
+    verify_nat_file_effective "$snapshot/before.rules"
+}
+
+verify_nat_file_effective() {
+    local expected_file=$1 expected live
+    expected=$(awk '/^-A (PREROUTING|POSTROUTING) / && /(lsec:|ufw-relay:)/ {print}' "$expected_file" | normalize_iptables_rule) || return 1
+    live=$(iptables-save -t nat 2>/dev/null | awk '/^-A (PREROUTING|POSTROUTING) / && /(lsec:|ufw-relay:)/ {print}' | normalize_iptables_rule) || return 1
+    [[ "$expected" == "$live" ]]
 }
 
 remove_transaction_ufw_rules() {
-    local batch_id=$1 marker result=0
+    local batch_id=$1 marker result=0 count
     local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
     [[ -f "$added_file" ]] || return 0
     while IFS= read -r marker; do
         [[ -n "$marker" ]] || continue
-        delete_ufw_rules_by_comment "$marker" || result=1
+        count=$(ufw_numbered_lines_for_marker "$marker" | awk 'NF {count++} END {print count + 0}') || { result=1; continue; }
+        if (( count == 1 )); then
+            delete_ufw_rules_by_comment "$marker" || result=1
+        elif (( count > 1 )); then
+            result=1
+        fi
     done < "$added_file"
     return "$result"
 }
 
 verify_transaction_ufw_rules_absent() {
-    local batch_id=$1 marker status
+    local batch_id=$1 marker
     local added_file="${BACKUP_DIR}/${batch_id}/ufw-intended.txt"
     [[ -f "$added_file" ]] || return 0
-    status=$(ufw status numbered 2>/dev/null) || return 1
     while IFS= read -r marker; do
         [[ -n "$marker" ]] || continue
-        grep -Fq -- "$marker" <<< "$status" && return 1
+        [[ -z $(ufw_numbered_lines_for_marker "$marker") ]] || return 1
     done < "$added_file"
     return 0
 }
@@ -2758,6 +3055,7 @@ create_forwarding_transaction() {
     local proto marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
     require_current_state_schema || return $?
+    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     begin_transaction "$batch_id" create "$(IFS=,; echo "${protocols[*]}")" || return "$RESULT_PRECHECK_FAILED"
     if ! apply_ipv4_forwarding_for_transaction "$batch_id"; then
@@ -2850,7 +3148,7 @@ record_delete_intent() {
 
 ufw_marker_present() {
     local marker=$1
-    ufw status numbered 2>/dev/null | grep -Fq -- "$marker"
+    [[ $(ufw_numbered_lines_for_marker "$marker" | awk 'NF {count++} END {print count + 0}') == 1 ]]
 }
 
 restore_deleted_ufw_rules() {
@@ -2868,22 +3166,24 @@ restore_deleted_ufw_rules() {
 }
 
 verify_deleted_ufw_rules_restored() {
-    local batch_id=$1 marker rest
+    local batch_id=$1 marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch
     local intended="${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv"
     [[ -f "$intended" ]] || return 0
-    while IFS=$'\t' read -r marker rest; do
+    while IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade original_batch; do
         [[ -n "$marker" ]] || continue
-        ufw_marker_present "$marker" || return 1
+        verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
+            "$landing_ip" "$landing_port" || return 1
     done < "$intended"
 }
 
 verify_forwarding_markers_absent() {
-    local marker status
-    status=$(ufw status numbered 2>/dev/null) || return 1
+    local marker live_nat
+    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
     for marker in "$@"; do
-        grep -Fq -- "$marker" "$BEFORE_RULES" && return 1
+        grep -Fq -- "--comment ${marker}:" "$BEFORE_RULES" && return 1
         [[ $(state_marker_count "$marker") == 0 ]] || return 1
-        grep -Fq -- "$marker" <<< "$status" && return 1
+        grep -Fq -- "--comment ${marker}:" <<< "$live_nat" && return 1
+        [[ -z $(ufw_numbered_lines_for_marker "$marker") ]] || return 1
     done
     return 0
 }
@@ -2915,11 +3215,12 @@ delete_forwarding_transaction() {
     local marker failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK deleted=0
 
     require_current_state_schema || return $?
+    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
     (( ${#markers[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     for marker in "${markers[@]}"; do
         validate_managed_marker "$marker" || return "$RESULT_PRECHECK_FAILED"
-        state_has_unique_marker "$marker" || return "$RESULT_REPAIR_REQUIRED"
+        verify_managed_rule_identity "$marker" || return "$RESULT_REPAIR_REQUIRED"
     done
     begin_transaction "$batch_id" delete "$(IFS=,; echo "${markers[*]}")" || return "$RESULT_PRECHECK_FAILED"
     record_delete_intent "$batch_id" "${markers[@]}" || {
@@ -2929,7 +3230,8 @@ delete_forwarding_transaction() {
     if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
         && set_transaction_phase "$batch_id" applying_ufw; then
         for marker in "${markers[@]}"; do
-            if delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
+            if verify_ufw_marker_effective "$marker" \
+                && delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
                 ((deleted += 1))
             else
                 set_transaction_phase "$batch_id" applying_ufw "UFW 规则删除失败：${marker}" || true
@@ -3023,12 +3325,12 @@ render_state_replacement() {
     local proto marker
     local -a old_markers=()
     IFS=',' read -r -a old_markers <<< "$old_csv"
-    render_state_without_markers "$current_state" "${old_markers[@]}"
+    render_state_without_markers "$current_state" "${old_markers[@]}" || return 1
     for proto in "$@"; do
         marker=$(managed_marker "$batch_id" "$proto")
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$marker" "$proto" "$source" "$in_if" "$public_port" "$out_if" \
-            "$landing_ip" "$landing_port" "$masquerade" "$batch_id"
+            "$landing_ip" "$landing_port" "$masquerade" "$batch_id" || return 1
     done
 }
 
@@ -3067,11 +3369,12 @@ replace_forwarding_transaction() {
     local marker proto deleted=0 added=0 failure_result=$RESULT_APPLY_FAILED_ROLLED_BACK
 
     require_current_state_schema || return $?
+    is_ufw_active || return "$RESULT_PRECHECK_FAILED"
     IFS=',' read -r -a old_markers <<< "$old_csv"
     (( ${#old_markers[@]} > 0 && ${#protocols[@]} > 0 )) || return "$RESULT_PRECHECK_FAILED"
     validate_staged_nat "$staged" || return "$RESULT_PRECHECK_FAILED"
     for marker in "${old_markers[@]}"; do
-        validate_managed_marker "$marker" && state_has_unique_marker "$marker" \
+        validate_managed_marker "$marker" && verify_managed_rule_identity "$marker" \
             || return "$RESULT_REPAIR_REQUIRED"
     done
     begin_transaction "$batch_id" overwrite "$old_csv" || return "$RESULT_PRECHECK_FAILED"
@@ -3082,7 +3385,8 @@ replace_forwarding_transaction() {
     if set_transaction_phase "$batch_id" applying_nat && apply_staged_nat_file "$staged" \
         && set_transaction_phase "$batch_id" applying_ufw; then
         for marker in "${old_markers[@]}"; do
-            if delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
+            if verify_ufw_marker_effective "$marker" \
+                && delete_ufw_rules_by_comment "$marker" && ! ufw_marker_present "$marker"; then
                 ((deleted += 1))
             else
                 break
@@ -3245,17 +3549,13 @@ delete_ufw_rules_by_comment() {
     while IFS= read -r number; do
         [[ -n "$number" ]] && numbers+=("$number")
     done < <(
-        ufw status numbered 2>/dev/null \
-            | grep -F "$comment" \
+        ufw_numbered_lines_for_marker "$comment" \
             | sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' \
             | sort -rn
     )
 
-    if (( ${#numbers[@]} > 0 )); then
-        for number in "${numbers[@]}"; do
-            ufw --force delete "$number"
-        done
-    fi
+    (( ${#numbers[@]} == 1 )) || return 1
+    ufw --force delete "${numbers[0]}"
 }
 
 
@@ -3626,26 +3926,39 @@ legacy_state_management_interactive() {
 }
 
 verify_consistent_state() {
-    local audit marker rest status
+    local audit marker rest
     require_current_state_schema || return 1
     audit=$(audit_legacy_forwarding_state)
     [[ -z "$audit" ]] && return 0
     grep -qv $'\tcurrent$' <<< "$audit" && return 1
-    status=$(ufw status numbered 2>/dev/null) || return 1
+    is_ufw_active || return 1
+    [[ ! -s "$STATE_FILE" ]] || verify_ipv4_forwarding_effective || return 1
     while IFS=$'\t' read -r marker rest; do
         [[ -n "$marker" ]] || continue
-        grep -Fq -- "--comment ${marker}:dnat" "$BEFORE_RULES" || return 1
-        grep -Fq -- "$marker" <<< "$status" || return 1
+        verify_managed_rule_identity "$marker" || return 1
     done < "$STATE_FILE"
 }
 
 attempt_protected_repair() {
-    local batch_id
+    local batch_id phase
     [[ -s "$PROTECTED_LOCK" ]] || return "$RESULT_OK"
     batch_id=$(transaction_value "$PROTECTED_LOCK" batch_id)
-    recover_transaction "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+    phase=$(transaction_value "$PROTECTED_LOCK" phase)
+    if [[ "$phase" == repair_required ]]; then
+        validate_reconciled_nat_structure || return "$RESULT_PROTECTED_LOCKOUT"
+    else
+        recover_transaction "$batch_id" || return "$RESULT_ROLLBACK_FAILED"
+    fi
     verify_consistent_state || return "$RESULT_PROTECTED_LOCKOUT"
     rm -f -- "$PROTECTED_LOCK" || return "$RESULT_PROTECTED_LOCKOUT"
+}
+
+validate_reconciled_nat_structure() {
+    if nat_managed_markers_present "$BEFORE_RULES"; then
+        validate_nat_managed_section "$BEFORE_RULES"
+    else
+        ! grep -Eq -- '--comment (lsec:|ufw-relay:)' "$BEFORE_RULES"
+    fi
 }
 
 transaction_maintenance_menu() {
@@ -3667,7 +3980,7 @@ transaction_maintenance_menu() {
                 [[ -n "$batch_id" ]] || continue
                 confirm "确认以新事务恢复 ${batch_id}？" N || continue
                 if begin_mutation "恢复备份 ${batch_id}"; then :; else continue; fi
-                if require_mutation_allowed && restore_snapshot_transaction "$batch_id"; then
+                if require_recovery_allowed restore && restore_snapshot_transaction "$batch_id"; then
                     ok "备份已恢复并验证"
                 else
                     result=$?
