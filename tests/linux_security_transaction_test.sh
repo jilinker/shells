@@ -23,6 +23,25 @@ assert_eq "$VERIFY_FAILURE_CODE" UFW_ROUTE_MISSING
 assert_eq "$VERIFY_FAILURE_PROTOCOL" tcp
 assert_eq "$VERIFY_FAILURE_ACTUAL" 'count=0 unexpected line'
 
+canonical_ufw_route=$(canonicalize_ufw_route_rule \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment 'lsec:batch:tcp'")
+assert_eq "$canonical_ufw_route" $'allow\teth0\teth1\ttcp\tany\t10.0.0.2\t52350\tlsec:batch:tcp'
+canonical_ufw_route=$(canonicalize_ufw_route_rule \
+    "ufw route allow proto udp from 192.0.2.0/24 to 10.0.0.3 port 443 out on ens4 in on ens3 comment 'lsec:batch:udp'")
+assert_eq "$canonical_ufw_route" $'allow\tens3\tens4\tudp\t192.0.2.0/24\t10.0.0.3\t443\tlsec:batch:udp'
+for invalid_ufw_route in \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp extra value comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 in on eth9 out on eth1 to 10.0.0.2 port 52350 proto tcp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 to 10.0.0.2 port 52350 proto tcp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 out on eth1 port 52350 proto tcp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 proto tcp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto sctp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment 'bad marker'" \
+    "ufw route deny in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment lsec:batch:tcp" \
+    "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment"; do
+    assert_status 1 canonicalize_ufw_route_rule "$invalid_ufw_route" >/dev/null 2>&1
+done
+
 TEST_TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_TMP"' EXIT
 
@@ -287,7 +306,8 @@ ufw() {
             local marker proto
             for marker in "${UFW_ADDED_MARKERS[@]}"; do
                 proto=${marker##*:}
-                printf "ufw route allow in on eth0 out on eth1 proto %s from any to 10.0.0.2 port 52350 comment '%s'\n" \
+                # UFW 会省略默认来源 any，并将 proto 规范化到 port 后方。
+                printf "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto %s comment '%s'\n" \
                     "$proto" "$marker"
             done
             return 0
@@ -384,8 +404,26 @@ cp "$STATE_FILE" "$TEST_TMP/state-before-drift"
 sed 's/\t52350\teth1/\t52351\teth1/' "$TEST_TMP/state-before-drift" > "$STATE_FILE"
 assert_status 1 verify_nat_marker_effective 'lsec:batch-success:tcp'
 cp "$TEST_TMP/state-before-drift" "$STATE_FILE"
-UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.20 port 523500 comment 'lsec:batch-success:tcp'"
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.20 port 52351 comment 'lsec:batch-success:tcp'"
 assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_ROUTE_SEMANTIC_MISMATCH
+UFW_SHOW_ADDED_OVERRIDE=$'ufw route allow proto tcp out on eth1 to 10.0.0.2 comment \'lsec:batch-success:tcp\' port 52350 in on eth0'
+assert_status 0 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+UFW_SHOW_ADDED_OVERRIDE=$'ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment \'lsec:batch-success:tcp\'\nufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.2 port 52350 comment \'lsec:batch-success:tcp\''
+assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_ROUTE_DUPLICATE
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp extra value comment 'lsec:batch-success:tcp'"
+assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_ROUTE_PARSE_FAILED
+UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto tcp comment 'lsec:batch-success:tcp'"
+saved_ufw_markers=("${UFW_ADDED_MARKERS[@]}")
+UFW_ADDED_MARKERS=()
+assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_RUNTIME_MARKER_MISSING
+UFW_ADDED_MARKERS=('lsec:batch-success:tcp' 'lsec:batch-success:tcp')
+assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" UFW_RUNTIME_MARKER_DUPLICATE
+UFW_ADDED_MARKERS=("${saved_ufw_markers[@]}")
 UFW_SHOW_ADDED_OVERRIDE=
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {gsub(/-p tcp/, "-p tcp -m tcp"); gsub(/-d 10.0.0.2/, "-d 10.0.0.2\/32"); print}' "$LIVE_NAT_FILE"; }
 assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'

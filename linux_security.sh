@@ -3074,14 +3074,164 @@ verify_ufw_marker_effective() {
 
 verify_ufw_route_definition() {
     local marker=$1 proto=$2 source=$3 in_if=$4 out_if=$5 landing_ip=$6 landing_port=$7
-    local expected added
-    expected="ufw route allow in on ${in_if} out on ${out_if} proto ${proto} from ${source} to ${landing_ip} port ${landing_port} comment ${marker}"
-    added=$(ufw show added 2>/dev/null | normalize_ufw_added_rule) || return 1
-    [[ $(awk -v expected="$expected" '$0 == expected {count++} END {print count + 0}' <<< "$added") == 1 ]]
+    local expected added line canonical normalized actual= parse_errors= runtime_output runtime_actual
+    local exact_count=0 marker_count=0
+
+    clear_verification_failure
+    expected=$(render_ufw_route_semantics "$marker" "$proto" "$source" "$in_if" \
+        "$out_if" "$landing_ip" "$landing_port")
+    if ! added=$(ufw show added 2>&1); then
+        set_verification_failure verify_ufw_persistent UFW_READ_FAILED "$proto" "$marker" \
+            '无法读取 UFW 持久化规则' "$expected" "$added"
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        normalized=$(normalize_ufw_added_rule <<< "$line")
+        [[ "$normalized" == 'ufw route '* ]] || continue
+        if canonical=$(canonicalize_ufw_route_rule "$normalized"); then
+            if [[ $(ufw_route_semantic_value "$canonical" comment) == "$marker" ]]; then
+                ((marker_count += 1))
+                [[ -z "$actual" ]] || actual+='; '
+                actual+="$canonical"
+                [[ "$canonical" == "$expected" ]] && ((exact_count += 1))
+            fi
+        elif [[ " $normalized " == *" comment ${marker} "* ]]; then
+            ((marker_count += 1))
+            [[ -z "$parse_errors" ]] || parse_errors+='; '
+            parse_errors+="$normalized"
+        fi
+    done <<< "$added"
+
+    if [[ -n "$parse_errors" ]]; then
+        set_verification_failure verify_ufw_persistent UFW_ROUTE_PARSE_FAILED "$proto" "$marker" \
+            '带有受管标记的 UFW 路由无法解析' "$expected" "$parse_errors"
+        return 1
+    fi
+    if (( marker_count == 0 )); then
+        set_verification_failure verify_ufw_persistent UFW_ROUTE_MISSING "$proto" "$marker" \
+            'UFW 持久化路由缺失' "$expected" 'marker_count=0'
+        return 1
+    fi
+    if (( marker_count > 1 || exact_count > 1 )); then
+        set_verification_failure verify_ufw_persistent UFW_ROUTE_DUPLICATE "$proto" "$marker" \
+            'UFW 持久化路由标记不唯一' "$expected" \
+            "marker_count=${marker_count}; exact_count=${exact_count}; ${actual}"
+        return 1
+    fi
+    if (( exact_count == 0 )); then
+        set_verification_failure verify_ufw_persistent UFW_ROUTE_SEMANTIC_MISMATCH "$proto" "$marker" \
+            'UFW 持久化路由字段与预期不一致' "$expected" "$actual"
+        return 1
+    fi
+
+    if ! runtime_output=$(ufw status numbered 2>&1); then
+        set_verification_failure verify_ufw_runtime UFW_RUNTIME_READ_FAILED "$proto" "$marker" \
+            '无法读取 UFW 运行时规则' "marker=${marker}; count=1" "$runtime_output"
+        return 1
+    fi
+    runtime_actual=$(awk -v marker="$marker" '$NF == marker {print}' <<< "$runtime_output")
+    marker_count=$(awk 'NF {count++} END {print count + 0}' <<< "$runtime_actual")
+    if (( marker_count == 0 )); then
+        set_verification_failure verify_ufw_runtime UFW_RUNTIME_MARKER_MISSING "$proto" "$marker" \
+            'UFW 运行时路由标记缺失' "marker=${marker}; count=1" 'count=0'
+        return 1
+    fi
+    if (( marker_count > 1 )); then
+        set_verification_failure verify_ufw_runtime UFW_RUNTIME_MARKER_DUPLICATE "$proto" "$marker" \
+            'UFW 运行时路由标记不唯一' "marker=${marker}; count=1" \
+            "count=${marker_count}; ${runtime_actual}"
+        return 1
+    fi
+    return 0
 }
 
 normalize_ufw_added_rule() {
     sed -E "s/comment ['\"]([^'\"]+)['\"]/comment \\1/g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
+}
+
+render_ufw_route_semantics() {
+    local marker=$1 proto=$2 source=$3 in_if=$4 out_if=$5 landing_ip=$6 landing_port=$7
+    printf 'allow\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+        "$in_if" "$out_if" "$proto" "$source" "$landing_ip" "$landing_port" "$marker"
+}
+
+ufw_route_semantic_value() {
+    local canonical=$1 key=$2
+    local action in_if out_if proto source destination port comment
+    IFS=$'\t' read -r action in_if out_if proto source destination port comment <<< "$canonical"
+    case "$key" in
+        action) printf '%s' "$action" ;;
+        in) printf '%s' "$in_if" ;;
+        out) printf '%s' "$out_if" ;;
+        proto) printf '%s' "$proto" ;;
+        source) printf '%s' "$source" ;;
+        destination) printf '%s' "$destination" ;;
+        port) printf '%s' "$port" ;;
+        comment) printf '%s' "$comment" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 解析本脚本创建的 UFW route allow 语法。字段顺序可变，省略 from 时按 any 处理。
+canonicalize_ufw_route_rule() {
+    local line=$1 token key
+    local action= in_if= out_if= proto= source=any destination= port= comment=
+    local seen_in=0 seen_out=0 seen_proto=0 seen_source=0 seen_destination=0 seen_port=0 seen_comment=0
+    local -a tokens=()
+    local i=3
+
+    line=$(normalize_ufw_added_rule <<< "$line")
+    read -r -a tokens <<< "$line"
+    (( ${#tokens[@]} >= 3 )) || return 1
+    [[ "${tokens[0]}" == ufw && "${tokens[1]}" == route && "${tokens[2]}" == allow ]] || return 1
+    action=allow
+
+    while (( i < ${#tokens[@]} )); do
+        key=${tokens[i]}
+        case "$key" in
+            in|out)
+                (( i + 2 < ${#tokens[@]} )) || return 1
+                [[ "${tokens[i + 1]}" == on ]] || return 1
+                token=${tokens[i + 2]}
+                if [[ "$key" == in ]]; then
+                    (( seen_in == 0 )) || return 1
+                    in_if=$token
+                    seen_in=1
+                else
+                    (( seen_out == 0 )) || return 1
+                    out_if=$token
+                    seen_out=1
+                fi
+                (( i += 3 ))
+                ;;
+            proto|from|to|port|comment)
+                (( i + 1 < ${#tokens[@]} )) || return 1
+                token=${tokens[i + 1]}
+                case "$key" in
+                    proto)   (( seen_proto == 0 )) || return 1; proto=$token; seen_proto=1 ;;
+                    from)    (( seen_source == 0 )) || return 1; source=$token; seen_source=1 ;;
+                    to)      (( seen_destination == 0 )) || return 1; destination=$token; seen_destination=1 ;;
+                    port)    (( seen_port == 0 )) || return 1; port=$token; seen_port=1 ;;
+                    comment) (( seen_comment == 0 )) || return 1; comment=$token; seen_comment=1 ;;
+                esac
+                (( i += 2 ))
+                ;;
+            *) return 1 ;;
+        esac
+    done
+
+    (( seen_in == 1 && seen_out == 1 && seen_proto == 1 \
+        && seen_destination == 1 && seen_port == 1 && seen_comment == 1 )) || return 1
+    [[ "$proto" == tcp || "$proto" == udp ]] || return 1
+    validate_interface_name "$in_if" || return 1
+    validate_interface_name "$out_if" || return 1
+    validate_ipv4_cidr_or_any "$source" || return 1
+    validate_ipv4 "$destination" || return 1
+    validate_port "$port" || return 1
+    [[ "$comment" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+    render_ufw_route_semantics "$comment" "$proto" "$source" "$in_if" "$out_if" \
+        "$destination" "$port"
 }
 
 verify_managed_rule_identity() {
