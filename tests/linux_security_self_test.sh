@@ -141,7 +141,11 @@ test -e "$preserved_config"
 test -e "$ROOT_DIR/linux_security.sh"
 
 install_lsec_candidate "$ROOT_DIR/linux_security.sh"
+set +e
 printf 'n\n' | uninstall_lsec >/dev/null
+uninstall_cancel_result=$?
+set -e
+assert_eq 10 "$uninstall_cancel_result"
 test -e "$INSTALL_PATH"
 printf 'y\n' | uninstall_lsec >/dev/null
 assert_fails test -e "$INSTALL_PATH"

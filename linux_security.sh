@@ -98,6 +98,40 @@ result_message() {
     esac
 }
 
+normalize_result_code() {
+    case ${1:-1} in
+        0|10|20|30|40|50|60|70) return "${1:-1}" ;;
+        *) return "$RESULT_PRECHECK_FAILED" ;;
+    esac
+}
+
+run_mutation_action() {
+    local operation=$1 function=$2 result
+    shift 2
+    if begin_mutation "$operation"; then :; else
+        result=$?
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if require_mutation_allowed; then :; else
+        result=$?
+        end_mutation
+        error "$(result_message "$result")"
+        return "$result"
+    fi
+    if "$function" "$@"; then result=$RESULT_OK; else
+        result=$?
+        normalize_result_code "$result" || result=$?
+    fi
+    end_mutation
+    case "$result" in
+        0) ok "$(result_message "$result")" ;;
+        10) warn "$(result_message "$result")" ;;
+        *) error "$(result_message "$result")" ;;
+    esac
+    return "$result"
+}
+
 # 获取所有系统变更共用的非阻塞排他锁。
 begin_mutation() {
     local operation=${1:-未命名操作}
@@ -899,7 +933,7 @@ uninstall_lsec() {
     fi
     warn "只会删除 ${INSTALL_PATH}"
     warn "UFW SSH Fail2Ban 配置和状态都会保留"
-    confirm "确认卸载 lsec？" N || return 0
+    confirm "确认卸载 lsec？" N || return "$RESULT_CANCELLED"
     if ! remove_installed_lsec; then
         error "lsec 卸载失败"
         return 1
@@ -1654,7 +1688,7 @@ ssh_management_menu() {
 
     clear || true
     echo "正在检查 SSH 管理环境..."
-    if ! check_ssh_environment; then
+    if ! run_mutation_action "准备 SSH 管理环境" check_ssh_environment; then
         pause
         return 0
     fi
@@ -1675,10 +1709,10 @@ ssh_management_menu() {
 
         case "$choice" in
             1) show_ssh_status; pause ;;
-            2) add_root_public_key_interactive || true; pause ;;
-            3) start_ssh_port_migration || true; pause ;;
-            4) finish_ssh_port_migration || true; pause ;;
-            5) apply_ssh_hardening || true; pause ;;
+            2) if run_mutation_action "添加 root SSH 公钥" add_root_public_key_interactive; then :; else :; fi; pause ;;
+            3) if run_mutation_action "开始 SSH 端口迁移" start_ssh_port_migration; then :; else :; fi; pause ;;
+            4) if run_mutation_action "完成 SSH 端口迁移" finish_ssh_port_migration; then :; else :; fi; pause ;;
+            5) if run_mutation_action "应用 SSH 加固" apply_ssh_hardening; then :; else :; fi; pause ;;
             6)
                 if sshd -t && reload_ssh_runtime no; then
                     ok "SSH 配置校验通过并已重载"
@@ -1699,7 +1733,7 @@ fail2ban_management_menu() {
 
     clear || true
     echo "正在检查 Fail2Ban 管理环境..."
-    if ! check_fail2ban_environment; then
+    if ! run_mutation_action "准备 Fail2Ban 管理环境" check_fail2ban_environment; then
         pause
         return 0
     fi
@@ -1722,13 +1756,13 @@ fail2ban_management_menu() {
 
         case "$choice" in
             1) show_fail2ban_status; pause ;;
-            2) configure_fail2ban_sshd || true; pause ;;
-            3) set_fail2ban_recidive yes || true; pause ;;
-            4) set_fail2ban_recidive no || true; pause ;;
-            5) control_fail2ban_service start || true; pause ;;
-            6) control_fail2ban_service stop || true; pause ;;
-            7) control_fail2ban_service restart || true; pause ;;
-            8) control_fail2ban_service enable || true; pause ;;
+            2) if run_mutation_action "配置 Fail2Ban sshd" configure_fail2ban_sshd; then :; else :; fi; pause ;;
+            3) if run_mutation_action "启用 Fail2Ban recidive" set_fail2ban_recidive yes; then :; else :; fi; pause ;;
+            4) if run_mutation_action "禁用 Fail2Ban recidive" set_fail2ban_recidive no; then :; else :; fi; pause ;;
+            5) if run_mutation_action "启动 Fail2Ban" control_fail2ban_service start; then :; else :; fi; pause ;;
+            6) if run_mutation_action "停止 Fail2Ban" control_fail2ban_service stop; then :; else :; fi; pause ;;
+            7) if run_mutation_action "重启 Fail2Ban" control_fail2ban_service restart; then :; else :; fi; pause ;;
+            8) if run_mutation_action "启用 Fail2Ban 开机启动" control_fail2ban_service enable; then :; else :; fi; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac
@@ -3958,11 +3992,11 @@ forward_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_forward_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
-            2) delete_forward_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
+            1) if add_forward_rule_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            2) if delete_forward_rule_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             3)
                 warn "该操作只删除 ufw route 规则，不会清理手工配置的 DNAT/SNAT"
-                delete_direction_rules_interactive "转发" fwd || true
+                if run_mutation_action "删除独立 UFW 路由规则" delete_direction_rules_interactive "转发" fwd; then :; else :; fi
                 invalidate_ufw_snapshot
                 pause
                 ;;
@@ -3989,8 +4023,8 @@ inbound_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_inbound_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
-            2) delete_direction_rules_interactive "入站" in || true; invalidate_ufw_snapshot; pause ;;
+            1) if run_mutation_action "添加 UFW 入站规则" add_inbound_rule_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            2) if run_mutation_action "删除 UFW 入站规则" delete_direction_rules_interactive "入站" in; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             3) ensure_ufw_snapshot && printf '%s\n' "$UFW_STATUS_NUMBERED_CACHE"; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
@@ -4012,8 +4046,8 @@ outbound_menu() {
         echo "0) 返回上一级"
         read -r -p "请选择: " choice
         case "$choice" in
-            1) add_outbound_rule_interactive || true; invalidate_ufw_snapshot; pause ;;
-            2) delete_direction_rules_interactive "出站" out || true; invalidate_ufw_snapshot; pause ;;
+            1) if run_mutation_action "添加 UFW 出站规则" add_outbound_rule_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            2) if run_mutation_action "删除 UFW 出站规则" delete_direction_rules_interactive "出站" out; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             3) ensure_ufw_snapshot && printf '%s\n' "$UFW_STATUS_NUMBERED_CACHE"; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
@@ -4022,7 +4056,7 @@ outbound_menu() {
 }
 
 control_menu() {
-    local choice level
+    local choice
     while true; do
         clear || true
         echo "========================================"
@@ -4049,40 +4083,45 @@ control_menu() {
                 pause
                 ;;
             2) if setup_and_enable_ufw; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
-            3) reload_ufw || true; invalidate_ufw_snapshot; pause ;;
-            4)
-                warn "禁用 UFW 会停止防火墙保护，但不会删除规则。"
-                if confirm "确认禁用 UFW？" N; then
-                    ufw disable
-                fi
-                invalidate_ufw_snapshot
-                pause
-                ;;
-            5)
-                echo "日志级别：1) off  2) low  3) medium  4) high  5) full"
-                read -r -p "请选择 [默认 2]: " level
-                level=${level:-2}
-                case "$level" in
-                    1) ufw logging off ;;
-                    2) ufw logging low ;;
-                    3) ufw logging medium ;;
-                    4) ufw logging high ;;
-                    5) ufw logging full ;;
-                    *) warn "无效选项" ;;
-                esac
-                invalidate_ufw_snapshot
-                pause
-                ;;
+            3) if run_mutation_action "重新加载 UFW" reload_ufw; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            4) if run_mutation_action "禁用 UFW" disable_ufw_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
+            5) if run_mutation_action "设置 UFW 日志级别" set_ufw_logging_interactive; then :; else :; fi; invalidate_ufw_snapshot; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; pause ;;
         esac
     done
 }
 
+disable_ufw_interactive() {
+    warn "禁用 UFW 会停止防火墙保护，但不会删除规则。"
+    confirm "确认禁用 UFW？" N || return "$RESULT_CANCELLED"
+    ufw disable
+}
+
+set_ufw_logging_interactive() {
+    local level
+    echo "日志级别：1) off  2) low  3) medium  4) high  5) full"
+    read -r -p "请选择 [默认 2]: " level
+    case ${level:-2} in
+        1) ufw logging off ;;
+        2) ufw logging low ;;
+        3) ufw logging medium ;;
+        4) ufw logging high ;;
+        5) ufw logging full ;;
+        *) return "$RESULT_PRECHECK_FAILED" ;;
+    esac
+}
+
 show_docker_warning() {
     if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
         warn "检测到 Docker 正在运行。Docker 发布端口可能使用自己的防火墙链，不能仅依赖普通 UFW 入站规则。"
     fi
+}
+
+prepare_ufw_management_environment() {
+    check_debian_family || return 1
+    install_ufw_if_needed || return 1
+    init_state
 }
 
 ufw_management_menu() {
@@ -4095,17 +4134,10 @@ ufw_management_menu() {
     fi
 
     echo "正在检查 UFW 运行环境..."
-    if ! check_debian_family; then
+    if ! run_mutation_action "准备 UFW 管理环境" prepare_ufw_management_environment; then
         pause
         return 0
     fi
-
-    if ! install_ufw_if_needed; then
-        pause
-        return 0
-    fi
-
-    init_state
     invalidate_ufw_snapshot
     show_docker_warning
 
@@ -4272,7 +4304,12 @@ main() {
 
     if is_streamed_source "${BASH_SOURCE[0]}"; then
         info "正在安装 lsec 到 ${INSTALL_PATH}"
-        install_lsec_candidate "${BASH_SOURCE[0]}" || die "lsec 安装失败"
+        begin_mutation "安装 lsec" || die "无法获取全局变更锁"
+        if ! install_lsec_candidate "${BASH_SOURCE[0]}"; then
+            end_mutation
+            die "lsec 安装失败"
+        fi
+        end_mutation
         ok "lsec 安装完成"
         exec "$INSTALL_PATH" "$@"
     fi
@@ -4284,8 +4321,8 @@ main() {
             fi
             main_menu
             ;;
-        upgrade) upgrade_lsec ;;
-        uninstall) uninstall_lsec ;;
+        upgrade) run_mutation_action "升级 lsec" upgrade_lsec ;;
+        uninstall) run_mutation_action "卸载 lsec" uninstall_lsec ;;
         help|-h|--help) show_lsec_usage ;;
         *) show_lsec_usage; return 2 ;;
     esac

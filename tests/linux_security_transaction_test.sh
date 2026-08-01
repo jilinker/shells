@@ -764,4 +764,11 @@ restore_journal=$(grep -l $'operation\trestore' "$TRANSACTION_DIR"/*.txn | head 
 assert_file_contains "$restore_journal" $'phase\tcommitted'
 assert_contains "$(declare -f forward_menu)" 'transaction_maintenance_menu'
 
+assert_not_contains "$(declare -f forward_menu)" 'add_forward_rule_interactive || true'
+assert_not_contains "$(declare -f forward_menu)" 'delete_forward_rule_interactive || true'
+assert_contains "$(declare -f ssh_management_menu)" 'run_mutation_action'
+assert_contains "$(declare -f fail2ban_management_menu)" 'run_mutation_action'
+assert_contains "$(declare -f inbound_menu)" 'run_mutation_action'
+assert_contains "$(declare -f outbound_menu)" 'run_mutation_action'
+
 printf 'linux security transaction test passed\n'
