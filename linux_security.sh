@@ -2992,12 +2992,27 @@ restore_owned_ipv4_forwarding() {
 verify_forwarding_batch() {
     local batch_id=$1
     shift
-    local proto marker
-    is_ufw_active || return 1
+    local proto marker count
+    clear_verification_failure
+    if ! is_ufw_active; then
+        set_verification_failure verify_ufw_status UFW_INACTIVE '' '' \
+            'UFW 当前未启用' 'Status: active' 'Status: inactive or unreadable'
+        return 1
+    fi
     verify_ipv4_forwarding_effective || return 1
     for proto in "$@"; do
         marker=$(managed_marker "$batch_id" "$proto")
-        state_has_unique_marker "$marker" || return 1
+        count=$(state_marker_count "$marker")
+        if (( count == 0 )); then
+            set_verification_failure verify_state STATE_MARKER_MISSING "$proto" "$marker" \
+                '状态文件缺少受管规则' 'count=1' 'count=0'
+            return 1
+        fi
+        if (( count > 1 )); then
+            set_verification_failure verify_state STATE_MARKER_DUPLICATE "$proto" "$marker" \
+                '状态文件中的受管规则不唯一' 'count=1' "count=${count}"
+            return 1
+        fi
         verify_nat_marker_effective "$marker" || return 1
         verify_ufw_marker_effective "$marker" || return 1
     done
@@ -3013,37 +3028,109 @@ normalize_iptables_rule_for_delete() {
 
 verify_nat_marker_effective() {
     local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch
-    local expected_dnat expected_snat persisted_dnat persisted_snat live_nat live_dnat live_snat
+    local expected_dnat expected_snat persisted_dnat persisted_snat live_nat live_raw live_dnat live_snat count
     row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print}' "$STATE_FILE") || return 1
-    [[ $(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}') == 1 ]] || return 1
+    count=$(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}')
+    proto=${marker##*:}
+    if (( count == 0 )); then
+        set_verification_failure verify_state STATE_MARKER_MISSING "$proto" "$marker" \
+            '状态文件缺少受管规则' 'count=1' 'count=0'
+        return 1
+    fi
+    if (( count > 1 )); then
+        set_verification_failure verify_state STATE_MARKER_DUPLICATE "$proto" "$marker" \
+            '状态文件中的受管规则不唯一' 'count=1' "count=${count}"
+        return 1
+    fi
     IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch <<< "$row"
-    expected_dnat=$(render_expected_dnat_rule "$marker" "$proto" "$source" "$in_if" \
-        "$public_port" "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules) || return 1
-    expected_snat=$(render_expected_snat_rule "$marker" "$proto" "$out_if" \
-        "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules) || return 1
-    persisted_dnat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
+    if ! expected_dnat=$(render_expected_dnat_rule "$marker" "$proto" "$source" "$in_if" \
+        "$public_port" "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_expected NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '无法规范化预期 DNAT 规则' 'valid canonical DNAT' 'expected DNAT parse failed'
+        return 1
+    fi
+    if ! expected_snat=$(render_expected_snat_rule "$marker" "$proto" "$out_if" \
+        "$landing_ip" "$landing_port" | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_expected NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '无法规范化预期 SNAT 规则' 'valid canonical SNAT' 'expected SNAT parse failed'
+        return 1
+    fi
+    if ! persisted_dnat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
         | managed_nat_rules_for_marker_and_chain "$marker" PREROUTING \
-        | canonicalize_managed_nat_rules) || return 1
-    [[ "$persisted_dnat" == "$expected_dnat" ]] || return 1
-    persisted_snat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
+        | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_persistent NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '持久化 DNAT 规则无法解析' "$expected_dnat" \
+            "$(managed_nat_raw_rules_for_marker "$BEFORE_RULES" "$marker" PREROUTING)"
+        return 1
+    fi
+    if [[ "$persisted_dnat" != "$expected_dnat" ]]; then
+        set_verification_failure verify_nat_persistent NAT_PERSISTED_DNAT_MISMATCH "$proto" "$marker" \
+            '持久化 DNAT 规则与预期不一致' "$expected_dnat" "${persisted_dnat:-count=0}"
+        return 1
+    fi
+    if ! persisted_snat=$(normalize_iptables_rule_for_delete < "$BEFORE_RULES" \
         | managed_nat_rules_for_marker_and_chain "$marker" POSTROUTING \
-        | canonicalize_managed_nat_rules) || return 1
-    if [[ "$masquerade" == yes ]]; then
-        [[ "$persisted_snat" == "$expected_snat" ]] || return 1
-    else
-        [[ -z "$persisted_snat" ]] || return 1
+        | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_persistent NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '持久化 SNAT 规则无法解析' "$expected_snat" \
+            "$(managed_nat_raw_rules_for_marker "$BEFORE_RULES" "$marker" POSTROUTING)"
+        return 1
     fi
-    live_nat=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
-    live_dnat=$(managed_nat_rules_for_marker_and_chain "$marker" PREROUTING <<< "$live_nat" \
-        | canonicalize_managed_nat_rules) || return 1
-    [[ "$live_dnat" == "$expected_dnat" ]] || return 1
-    live_snat=$(managed_nat_rules_for_marker_and_chain "$marker" POSTROUTING <<< "$live_nat" \
-        | canonicalize_managed_nat_rules) || return 1
     if [[ "$masquerade" == yes ]]; then
-        [[ "$live_snat" == "$expected_snat" ]] || return 1
+        if [[ "$persisted_snat" != "$expected_snat" ]]; then
+            set_verification_failure verify_nat_persistent NAT_PERSISTED_SNAT_MISMATCH "$proto" "$marker" \
+                '持久化 SNAT 规则与预期不一致' "$expected_snat" "${persisted_snat:-count=0}"
+            return 1
+        fi
     else
-        [[ -z "$live_snat" ]] || return 1
+        if [[ -n "$persisted_snat" ]]; then
+            set_verification_failure verify_nat_persistent NAT_PERSISTED_SNAT_MISMATCH "$proto" "$marker" \
+                '不应存在持久化 SNAT 规则' 'count=0' "$persisted_snat"
+            return 1
+        fi
     fi
+    if ! live_raw=$(iptables-save -t nat 2>&1); then
+        set_verification_failure verify_nat_live NAT_LIVE_READ_FAILED "$proto" "$marker" \
+            '无法读取运行时 NAT 规则' 'iptables-save -t nat succeeds' "$live_raw"
+        return 1
+    fi
+    live_nat=$(normalize_iptables_rule_for_delete <<< "$live_raw")
+    if ! live_dnat=$(managed_nat_rules_for_marker_and_chain "$marker" PREROUTING <<< "$live_nat" \
+        | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_live NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '运行时 DNAT 规则无法解析' "$expected_dnat" "$live_raw"
+        return 1
+    fi
+    if [[ "$live_dnat" != "$expected_dnat" ]]; then
+        set_verification_failure verify_nat_live NAT_LIVE_DNAT_MISMATCH "$proto" "$marker" \
+            '运行时 DNAT 规则与预期不一致' "$expected_dnat" "${live_dnat:-count=0}"
+        return 1
+    fi
+    if ! live_snat=$(managed_nat_rules_for_marker_and_chain "$marker" POSTROUTING <<< "$live_nat" \
+        | canonicalize_managed_nat_rules); then
+        set_verification_failure verify_nat_live NAT_RULE_PARSE_FAILED "$proto" "$marker" \
+            '运行时 SNAT 规则无法解析' "$expected_snat" "$live_raw"
+        return 1
+    fi
+    if [[ "$masquerade" == yes ]]; then
+        if [[ "$live_snat" != "$expected_snat" ]]; then
+            set_verification_failure verify_nat_live NAT_LIVE_SNAT_MISMATCH "$proto" "$marker" \
+                '运行时 SNAT 规则与预期不一致' "$expected_snat" "${live_snat:-count=0}"
+            return 1
+        fi
+    else
+        if [[ -n "$live_snat" ]]; then
+            set_verification_failure verify_nat_live NAT_LIVE_SNAT_MISMATCH "$proto" "$marker" \
+                '不应存在运行时 SNAT 规则' 'count=0' "$live_snat"
+            return 1
+        fi
+    fi
+}
+
+managed_nat_raw_rules_for_marker() {
+    local file=$1 marker=$2 chain=$3
+    normalize_iptables_rule_for_delete < "$file" \
+        | managed_nat_rules_for_marker_and_chain "$marker" "$chain"
 }
 
 render_expected_dnat_rule() {
@@ -3064,9 +3151,20 @@ ufw_numbered_lines_for_marker() {
 }
 
 verify_ufw_marker_effective() {
-    local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch line
+    local marker=$1 row proto source in_if public_port out_if landing_ip landing_port masquerade batch line count
     row=$(awk -F '\t' -v marker="$marker" '$1 == marker {print}' "$STATE_FILE") || return 1
-    [[ $(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}') == 1 ]] || return 1
+    count=$(printf '%s\n' "$row" | awk 'NF {count++} END {print count + 0}')
+    proto=${marker##*:}
+    if (( count == 0 )); then
+        set_verification_failure verify_state STATE_MARKER_MISSING "$proto" "$marker" \
+            '状态文件缺少受管规则' 'count=1' 'count=0'
+        return 1
+    fi
+    if (( count > 1 )); then
+        set_verification_failure verify_state STATE_MARKER_DUPLICATE "$proto" "$marker" \
+            '状态文件中的受管规则不唯一' 'count=1' "count=${count}"
+        return 1
+    fi
     IFS=$'\t' read -r marker proto source in_if public_port out_if landing_ip landing_port masquerade batch <<< "$row"
     verify_ufw_route_definition "$marker" "$proto" "$source" "$in_if" "$out_if" \
         "$landing_ip" "$landing_port"
@@ -3242,8 +3340,20 @@ verify_managed_rule_identity() {
 }
 
 verify_ipv4_forwarding_effective() {
-    [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]] \
-        && [[ $(persistent_ipv4_forwarding_value) == 1 ]]
+    local runtime persistent
+    runtime=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || runtime=unknown
+    if [[ "$runtime" != 1 ]]; then
+        set_verification_failure verify_ipv4_runtime IPV4_RUNTIME_DISABLED '' '' \
+            '运行时 IPv4 forwarding 未启用' '1' "$runtime"
+        return 1
+    fi
+    persistent=$(persistent_ipv4_forwarding_value 2>/dev/null) || persistent=unknown
+    if [[ "$persistent" != 1 ]]; then
+        set_verification_failure verify_ipv4_persistent IPV4_PERSISTENT_DISABLED '' '' \
+            '持久化 IPv4 forwarding 未启用' '1' "$persistent"
+        return 1
+    fi
+    return 0
 }
 
 restore_transaction_snapshot() {
@@ -3295,16 +3405,38 @@ verify_snapshot_restored() {
 }
 
 verify_nat_file_effective() {
-    local expected_file=$1 chain expected live live_dump
-    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
+    local expected_file=$1 chain expected live live_dump live_raw code
+    if ! live_raw=$(iptables-save -t nat 2>&1); then
+        set_verification_failure verify_nat_file NAT_LIVE_READ_FAILED '' '' \
+            '无法读取运行时 NAT 规则' 'iptables-save -t nat succeeds' "$live_raw"
+        return 1
+    fi
+    live_dump=$(normalize_iptables_rule_for_delete <<< "$live_raw")
     for chain in PREROUTING POSTROUTING; do
-        expected=$(normalize_iptables_rule_for_delete < "$expected_file" \
+        if ! expected=$(normalize_iptables_rule_for_delete < "$expected_file" \
             | managed_nat_rules_for_chain "$chain" \
-            | canonicalize_managed_nat_rules) || return 1
-        live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump" \
-            | canonicalize_managed_nat_rules) || return 1
-        [[ "$expected" == "$live" ]] || return 1
+            | canonicalize_managed_nat_rules); then
+            set_verification_failure verify_nat_file NAT_FILE_PARSE_FAILED '' '' \
+                "持久化 ${chain} 受管规则无法解析" 'valid canonical managed NAT' \
+                "$(managed_nat_rules_for_chain "$chain" < "$expected_file")"
+            return 1
+        fi
+        if ! live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump" \
+            | canonicalize_managed_nat_rules); then
+            set_verification_failure verify_nat_file NAT_FILE_PARSE_FAILED '' '' \
+                "运行时 ${chain} 受管规则无法解析" "$expected" \
+                "$(managed_nat_rules_for_chain "$chain" <<< "$live_dump")"
+            return 1
+        fi
+        if [[ "$expected" != "$live" ]]; then
+            code="NAT_FILE_${chain}_MISMATCH"
+            set_verification_failure verify_nat_file "$code" '' '' \
+                "运行时 ${chain} 受管规则集合与持久化配置不一致" \
+                "${expected:-count=0}" "${live:-count=0}"
+            return 1
+        fi
     done
+    return 0
 }
 
 managed_nat_rules_for_chain() {

@@ -276,12 +276,16 @@ UFW_DELETE_COUNT=0
 UFW_FAIL_DELETE_AT=0
 UFW_SHOW_ADDED_OVERRIDE=
 UFW_RELOAD_SYNC=1
+UFW_ACTIVE=1
 LIVE_NAT_FILE="$TEST_TMP/live-nat.rules"
 cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
 ufw() {
     local previous= argument number index
     case "$*" in
-        'status') printf 'Status: active\n'; return 0 ;;
+        'status')
+            if (( UFW_ACTIVE == 1 )); then printf 'Status: active\n'; else printf 'Status: inactive\n'; fi
+            return 0
+            ;;
         'reload')
             (( UFW_RELOAD_SYNC == 0 )) || cp "$BEFORE_RULES" "$LIVE_NAT_FILE"
             return 0
@@ -403,6 +407,7 @@ assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
 cp "$STATE_FILE" "$TEST_TMP/state-before-drift"
 sed 's/\t52350\teth1/\t52351\teth1/' "$TEST_TMP/state-before-drift" > "$STATE_FILE"
 assert_status 1 verify_nat_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" NAT_PERSISTED_DNAT_MISMATCH
 cp "$TEST_TMP/state-before-drift" "$STATE_FILE"
 UFW_SHOW_ADDED_OVERRIDE="ufw route allow in on eth0 out on eth1 proto tcp from any to 10.0.0.20 port 52351 comment 'lsec:batch-success:tcp'"
 assert_status 1 verify_ufw_marker_effective 'lsec:batch-success:tcp'
@@ -429,6 +434,29 @@ iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {gsub(/-p tcp/, "-p tcp -
 assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
 iptables-save() { awk '/lsec:batch-success:tcp:dnat/ {print; print; next} /^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 assert_status 1 verify_nat_marker_effective 'lsec:batch-success:tcp'
+assert_eq "$VERIFY_FAILURE_CODE" NAT_LIVE_DNAT_MISMATCH
+iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
+cp "$STATE_FILE" "$TEST_TMP/state-unique"
+grep -v '^lsec:batch-success:tcp' "$TEST_TMP/state-unique" > "$STATE_FILE"
+assert_status 1 verify_forwarding_batch batch-success tcp udp
+assert_eq "$VERIFY_FAILURE_CODE" STATE_MARKER_MISSING
+assert_eq "$VERIFY_FAILURE_PROTOCOL" tcp
+cp "$TEST_TMP/state-unique" "$STATE_FILE"
+grep '^lsec:batch-success:tcp' "$TEST_TMP/state-unique" >> "$STATE_FILE"
+assert_status 1 verify_forwarding_batch batch-success tcp udp
+assert_eq "$VERIFY_FAILURE_CODE" STATE_MARKER_DUPLICATE
+cp "$TEST_TMP/state-unique" "$STATE_FILE"
+UFW_ACTIVE=0
+assert_status 1 verify_forwarding_batch batch-success tcp udp
+assert_eq "$VERIFY_FAILURE_CODE" UFW_INACTIVE
+UFW_ACTIVE=1
+iptables-save() {
+    sed '/lsec:batch-success:udp:dnat/s/--dport 52350/--dport 52351/' "$LIVE_NAT_FILE"
+}
+assert_status 1 verify_forwarding_batch batch-success tcp udp
+assert_eq "$VERIFY_FAILURE_CODE" NAT_LIVE_DNAT_MISMATCH
+assert_eq "$VERIFY_FAILURE_PROTOCOL" udp
+assert_eq "$VERIFY_FAILURE_MARKER" lsec:batch-success:udp
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; printf '%s\n' '-A PREROUTING -p tcp --dport 9999 -j DNAT --to-destination 172.17.0.2:9999'; }
 assert_status 0 verify_nat_file_effective "$BEFORE_RULES"
@@ -462,6 +490,7 @@ iptables-save() { sed 's/--to-destination 10.0.0.2:52350/--to-destination 10.0.0
 assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
 iptables-save() { sed 's/-j DNAT/-j ACCEPT/' "$LIVE_NAT_FILE"; }
 assert_status 1 verify_nat_file_effective "$BEFORE_RULES"
+assert_eq "$VERIFY_FAILURE_CODE" NAT_FILE_PARSE_FAILED
 iptables-save() { awk '/^-A (PREROUTING|POSTROUTING) / {print}' "$LIVE_NAT_FILE"; }
 iptables-save() {
     awk '/^-A PREROUTING / {rules[++count]=$0} END {for (i=count; i>=1; i--) print rules[i]}' "$LIVE_NAT_FILE"
@@ -793,6 +822,12 @@ sysctl() {
         *) return 1 ;;
     esac
 }
+assert_status 1 verify_ipv4_forwarding_effective
+assert_eq "$VERIFY_FAILURE_CODE" IPV4_RUNTIME_DISABLED
+SYSCTL_RUNTIME=1
+assert_status 1 verify_ipv4_forwarding_effective
+assert_eq "$VERIFY_FAILURE_CODE" IPV4_PERSISTENT_DISABLED
+SYSCTL_RUNTIME=0
 begin_transaction ipv4-batch create tcp
 apply_ipv4_forwarding_for_transaction ipv4-batch
 assert_eq "$SYSCTL_RUNTIME" 1
