@@ -3017,11 +3017,13 @@ verify_snapshot_restored() {
 
 verify_nat_file_effective() {
     local expected_file=$1 chain expected live live_dump
-    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule) || return 1
+    live_dump=$(iptables-save -t nat 2>/dev/null | normalize_iptables_rule_for_delete) || return 1
     for chain in PREROUTING POSTROUTING; do
-        expected=$(normalize_iptables_rule < "$expected_file" \
-            | managed_nat_rules_for_chain "$chain") || return 1
-        live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump") || return 1
+        expected=$(normalize_iptables_rule_for_delete < "$expected_file" \
+            | managed_nat_rules_for_chain "$chain" \
+            | canonicalize_managed_nat_rules) || return 1
+        live=$(managed_nat_rules_for_chain "$chain" <<< "$live_dump" \
+            | canonicalize_managed_nat_rules) || return 1
         [[ "$expected" == "$live" ]] || return 1
     done
 }
@@ -3037,6 +3039,65 @@ managed_nat_rules_for_chain() {
                     break
                 }
             }
+        }
+    '
+}
+
+canonicalize_managed_nat_rules() {
+    normalize_iptables_rule_for_delete | awk '
+        function fail() {
+            invalid=1
+        }
+        function set_value(name, value) {
+            if (seen[name]++) {
+                fail()
+                return
+            }
+            field[name]=value
+        }
+        function host_address(value) {
+            sub(/\/32$/, "", value)
+            return value
+        }
+        {
+            for (name in seen) delete seen[name]
+            for (name in field) delete field[name]
+            for (name in module) delete module[name]
+            invalid=0
+            if ($1 != "-A" || ($2 != "PREROUTING" && $2 != "POSTROUTING")) fail()
+            for (i=3; i<=NF && !invalid; i++) {
+                token=$i
+                if (token == "-p") set_value("proto", $(++i))
+                else if (token == "-s") set_value("source", $(++i))
+                else if (token == "-d") set_value("destination", $(++i))
+                else if (token == "-i") set_value("input", $(++i))
+                else if (token == "-o") set_value("output", $(++i))
+                else if (token == "--dport") set_value("dport", $(++i))
+                else if (token == "--comment") set_value("comment", $(++i))
+                else if (token == "-j") set_value("jump", $(++i))
+                else if (token == "--to-destination") set_value("translated", $(++i))
+                else if (token == "-m") {
+                    value=$(++i)
+                    if (value !~ /^(tcp|udp|comment)$/ || module[value]++) fail()
+                } else fail()
+                if (i > NF || $(i) == "") fail()
+            }
+            source=("source" in field) ? host_address(field["source"]) : "any"
+            destination=("destination" in field) ? host_address(field["destination"]) : "-"
+            input=("input" in field) ? field["input"] : "-"
+            output=("output" in field) ? field["output"] : "-"
+            translated=("translated" in field) ? field["translated"] : "-"
+            if (field["proto"] !~ /^(tcp|udp)$/ || field["dport"] !~ /^[0-9]+$/) fail()
+            if (field["comment"] !~ /^(lsec:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|ufw-relay:[A-Za-z0-9._-]+):(dnat|snat)$/) fail()
+            if ($2 == "PREROUTING" && (input == "-" || output != "-" || destination != "-" \
+                || field["jump"] != "DNAT" || translated == "-" || field["comment"] !~ /:dnat$/)) fail()
+            if ($2 == "POSTROUTING" && (input != "-" || output == "-" || destination == "-" \
+                || source != "any" || field["jump"] != "MASQUERADE" || translated != "-" \
+                || field["comment"] !~ /:snat$/)) fail()
+            if (invalid) exit 1
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+                $2, field["proto"], source, input, output, destination, field["dport"], \
+                field["comment"], field["jump"], translated
         }
     '
 }
