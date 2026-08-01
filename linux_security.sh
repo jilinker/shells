@@ -431,18 +431,28 @@ verify_legacy_ufw_mapping() {
 }
 
 rollback_legacy_migration() {
-    local batch_id=$1 mapping="${BACKUP_DIR}/${batch_id}/legacy-mapping.tsv" result=0
-    remove_transaction_ufw_rules "$batch_id" || result=1
-    restore_transaction_snapshot "$batch_id" || result=1
-    restore_legacy_ufw_rules "$mapping" || result=1
+    local batch_id=$1 mapping result=0 rollback_errors=
+    mapping="${BACKUP_DIR}/${batch_id}/legacy-mapping.tsv"
+    prepare_failed_transaction_rollback "$batch_id"
+    remove_transaction_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '删除迁移事务新增的 UFW 规则失败'); }
+    restore_transaction_snapshot "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复事务快照文件失败'); }
+    restore_legacy_ufw_rules "$mapping" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复旧 UFW 路由失败'); }
     sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
-        "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt" || result=1
-    verify_snapshot_restored "$batch_id" || result=1
-    verify_legacy_ufw_mapping "$mapping" || result=1
+        "${BACKUP_DIR}/${batch_id}/nat-sync-markers.txt" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '同步运行时 NAT 失败'); }
+    verify_snapshot_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务快照恢复验证失败'); }
+    verify_legacy_ufw_mapping "$mapping" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '旧 UFW 路由恢复验证失败'); }
     if (( result == 0 )); then
+        set_transaction_rollback_result "$batch_id" verified '' || true
         set_transaction_phase "$batch_id" rolled_back
         return 0
     fi
+    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
     protect_failed_transaction "$batch_id" rollback_failed '无法验证旧状态迁移回滚'
     return 1
 }
@@ -558,8 +568,19 @@ recover_transaction() {
     operation=$(transaction_value "$journal" operation)
     snapshot="${BACKUP_DIR}/${batch_id}"
     if [[ ! -d "$snapshot" || ! -f "$snapshot/before.rules" || ! -f "$snapshot/forwarding.tsv" ]]; then
+        clear_verification_failure
+        set_verification_failure recovery RECOVERY_SNAPSHOT_MISSING '' '' \
+            '事务快照缺失，无法自动恢复' 'complete transaction snapshot' "$snapshot"
+        record_transaction_failure "$batch_id" || true
+        set_transaction_rollback_result "$batch_id" failed '事务快照缺失' || true
         protect_failed_transaction "$batch_id" recovery_failed '事务快照缺失，无法自动恢复'
         return "$RESULT_ROLLBACK_FAILED"
+    fi
+    if [[ -z $(transaction_value "$journal" failure_code) ]]; then
+        clear_verification_failure
+        set_verification_failure recovery RECOVERY_OF_INCOMPLETE_TRANSACTION '' '' \
+            '检测到未完成事务，执行启动恢复' 'terminal transaction phase' \
+            "phase=$(transaction_value "$journal" phase)"
     fi
     case "$operation" in
         create) rollback_created_forwarding "$batch_id" ;;
@@ -569,6 +590,8 @@ recover_transaction() {
         migrate_legacy) rollback_legacy_migration "$batch_id" ;;
         restore) rollback_replaced_forwarding "$batch_id" ;;
         *)
+            record_transaction_failure "$batch_id" || true
+            set_transaction_rollback_result "$batch_id" failed "未知事务类型：${operation}" || true
             protect_failed_transaction "$batch_id" recovery_failed "未知事务类型：${operation}"
             return "$RESULT_ROLLBACK_FAILED"
             ;;
@@ -694,6 +717,7 @@ begin_transaction() {
     local batch_id=$1 operation=$2 rule_ids=${3:-}
     local snapshot="${BACKUP_DIR}/${batch_id}"
 
+    clear_verification_failure
     snapshot_current_state "$batch_id" "$operation" || return 1
     atomic_write "${TRANSACTION_DIR}/${batch_id}.txn" write_transaction_record \
         "$batch_id" "$operation" prepared "$snapshot" "$rule_ids" ''
@@ -728,7 +752,8 @@ render_transaction_failure() {
 }
 
 record_transaction_failure() {
-    local batch_id=$1 journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    local batch_id=$1 journal
+    journal="${TRANSACTION_DIR}/${batch_id}.txn"
     [[ -f "$journal" ]] || return 1
     verification_failure_present || return 1
     # 首个失败是事务根因；回滚或诊断阶段不得覆盖。
@@ -768,6 +793,104 @@ set_transaction_evidence_error() {
     [[ -f "$journal" ]] || return 1
     detail=$(sanitize_transaction_value "$detail")
     atomic_write "$journal" render_transaction_evidence_error "$journal" "$detail"
+}
+
+write_transaction_verification_evidence() {
+    local journal=$1
+    awk -F '\t' '
+        $1 ~ /^(batch_id|operation|phase|failure_stage|failure_code|failure_protocol|failure_marker|failure_summary|failure_expected|failure_actual|failure_at)$/ {print}
+    ' "$journal"
+}
+
+capture_evidence_command() {
+    local destination=$1
+    shift
+    local temp status=0
+    temp=$(mktemp "${destination}.tmp.XXXXXX") || return 1
+    chmod 600 "$temp" || { rm -f -- "$temp"; return 1; }
+    "$@" > "$temp" 2>&1 || status=$?
+    mv -f -- "$temp" "$destination" || return 1
+    return "$status"
+}
+
+write_ipv4_failure_evidence() {
+    local runtime persistent
+    runtime=$(sysctl -n net.ipv4.ip_forward 2>&1) || runtime="unavailable: ${runtime}"
+    persistent=$(persistent_ipv4_forwarding_value 2>&1) || persistent="unavailable: ${persistent}"
+    printf 'runtime\t%s\npersistent\t%s\n' "$runtime" "$persistent"
+}
+
+append_diagnostic_error() {
+    local current=$1 detail=$2
+    if [[ -n "$current" ]]; then
+        printf '%s; %s' "$current" "$detail"
+    else
+        printf '%s' "$detail"
+    fi
+}
+
+# 尽力保留回滚前现场；任何采集失败只记入日志，不得阻止回滚。
+capture_transaction_failure_evidence() {
+    local batch_id=$1 snapshot journal failure_dir errors= destination
+    snapshot="${BACKUP_DIR}/${batch_id}"
+    journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -d "$snapshot" && -f "$journal" ]] || return 0
+    failure_dir="${snapshot}/failure"
+    if [[ -f "${failure_dir}/verification.tsv" ]]; then
+        return 0
+    fi
+    if ! install -d -m 700 "$failure_dir"; then
+        set_transaction_evidence_error "$batch_id" '无法创建回滚前证据目录' || true
+        return 0
+    fi
+
+    destination="${failure_dir}/verification.tsv"
+    atomic_write "$destination" write_transaction_verification_evidence "$journal" \
+        || errors=$(append_diagnostic_error "$errors" 'verification.tsv 写入失败')
+    capture_evidence_command "${failure_dir}/iptables-save-nat.txt" iptables-save -t nat \
+        || errors=$(append_diagnostic_error "$errors" 'iptables-save -t nat 采集失败')
+    capture_evidence_command "${failure_dir}/ufw-show-added.txt" ufw show added \
+        || errors=$(append_diagnostic_error "$errors" 'ufw show added 采集失败')
+    capture_evidence_command "${failure_dir}/ufw-status-numbered.txt" ufw status numbered \
+        || errors=$(append_diagnostic_error "$errors" 'ufw status numbered 采集失败')
+    atomic_write "${failure_dir}/ipv4-forwarding.txt" write_ipv4_failure_evidence \
+        || errors=$(append_diagnostic_error "$errors" 'IPv4 forwarding 采集失败')
+    if [[ -f "$BEFORE_RULES" ]]; then
+        install -m 600 "$BEFORE_RULES" "${failure_dir}/before.rules.failed" \
+            || errors=$(append_diagnostic_error "$errors" 'before.rules.failed 复制失败')
+    else
+        errors=$(append_diagnostic_error "$errors" 'before.rules 不存在')
+    fi
+    if [[ -f "$STATE_FILE" ]]; then
+        install -m 600 "$STATE_FILE" "${failure_dir}/forwarding.tsv.failed" \
+            || errors=$(append_diagnostic_error "$errors" 'forwarding.tsv.failed 复制失败')
+    else
+        errors=$(append_diagnostic_error "$errors" 'forwarding.tsv 不存在')
+    fi
+    set_transaction_evidence_error "$batch_id" "$errors" || true
+    return 0
+}
+
+prepare_failed_transaction_rollback() {
+    local batch_id=$1 journal phase detail
+    journal="${TRANSACTION_DIR}/${batch_id}.txn"
+    [[ -f "$journal" ]] || return 0
+    if [[ -z $(transaction_value "$journal" failure_code) ]]; then
+        if ! verification_failure_present; then
+            phase=$(transaction_value "$journal" phase)
+            detail=$(transaction_value "$journal" last_error)
+            [[ -n "$detail" ]] || detail="事务阶段 ${phase:-unknown} 执行失败"
+            set_verification_failure "${phase:-transaction}" TRANSACTION_STEP_FAILED '' '' \
+                "$detail" 'transaction step succeeds' 'command returned nonzero or postcondition failed'
+        fi
+        record_transaction_failure "$batch_id" || true
+    fi
+    capture_transaction_failure_evidence "$batch_id"
+}
+
+append_rollback_error() {
+    local current=$1 detail=$2
+    append_diagnostic_error "$current" "$detail"
 }
 
 render_transaction_phase() {
@@ -2488,18 +2611,28 @@ verify_ufw_bootstrap_markers() {
 }
 
 rollback_ufw_bootstrap() {
-    local batch_id=$1 result=0
+    local batch_id=$1 result=0 rollback_errors=
+    prepare_failed_transaction_rollback "$batch_id"
     if is_ufw_active; then
-        ufw disable || result=1
+        ufw disable \
+            || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '禁用新启用的 UFW 失败'); }
     fi
-    remove_transaction_ufw_rules "$batch_id" || result=1
-    restore_ufw_default_policies "$batch_id" || result=1
-    is_ufw_active && result=1
-    verify_transaction_ufw_rules_absent "$batch_id" || result=1
+    remove_transaction_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '删除 UFW 初始化规则失败'); }
+    restore_ufw_default_policies "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复 UFW 默认策略失败'); }
+    if is_ufw_active; then
+        result=1
+        rollback_errors=$(append_rollback_error "$rollback_errors" 'UFW 回滚后仍为 active')
+    fi
+    verify_transaction_ufw_rules_absent "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" 'UFW 初始化规则残留'); }
     if (( result == 0 )); then
+        set_transaction_rollback_result "$batch_id" verified '' || true
         set_transaction_phase "$batch_id" rolled_back
         return 0
     fi
+    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
     protect_failed_transaction "$batch_id" rollback_failed '无法验证 UFW 初始化回滚'
     return 1
 }
@@ -3681,17 +3814,25 @@ protect_failed_transaction() {
 
 rollback_created_forwarding() {
     local batch_id=$1
-    local result=0
-    remove_transaction_ufw_rules "$batch_id" || result=1
-    restore_transaction_snapshot "$batch_id" || result=1
+    local result=0 rollback_errors=
+    prepare_failed_transaction_rollback "$batch_id"
+    remove_transaction_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '删除事务新增的 UFW 规则失败'); }
+    restore_transaction_snapshot "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复事务快照文件失败'); }
     sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
-        "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" || result=1
-    verify_snapshot_restored "$batch_id" || result=1
-    verify_transaction_ufw_rules_absent "$batch_id" || result=1
+        "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '同步运行时 NAT 失败'); }
+    verify_snapshot_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务快照恢复验证失败'); }
+    verify_transaction_ufw_rules_absent "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务 UFW 规则仍有残留'); }
     if (( result == 0 )); then
+        set_transaction_rollback_result "$batch_id" verified '' || true
         set_transaction_phase "$batch_id" rolled_back
         return 0
     fi
+    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
     protect_failed_transaction "$batch_id" rollback_failed '无法验证事务快照恢复'
     return 1
 }
@@ -3840,17 +3981,25 @@ verify_forwarding_markers_absent() {
 }
 
 rollback_deleted_forwarding() {
-    local batch_id=$1 result=0
-    restore_transaction_snapshot "$batch_id" || result=1
-    restore_deleted_ufw_rules "$batch_id" || result=1
+    local batch_id=$1 result=0 rollback_errors=
+    prepare_failed_transaction_rollback "$batch_id"
+    restore_transaction_snapshot "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复事务快照文件失败'); }
+    restore_deleted_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复已删除的 UFW 规则失败'); }
     sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
-        "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" || result=1
-    verify_snapshot_restored "$batch_id" || result=1
-    verify_deleted_ufw_rules_restored "$batch_id" || result=1
+        "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '同步运行时 NAT 失败'); }
+    verify_snapshot_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务快照恢复验证失败'); }
+    verify_deleted_ufw_rules_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '已删除 UFW 规则恢复验证失败'); }
     if (( result == 0 )); then
+        set_transaction_rollback_result "$batch_id" verified '' || true
         set_transaction_phase "$batch_id" rolled_back
         return 0
     fi
+    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
     protect_failed_transaction "$batch_id" rollback_failed '无法验证删除事务恢复'
     return 1
 }
@@ -3999,25 +4148,36 @@ commit_forward_state_replacement() {
 }
 
 rollback_replaced_forwarding() {
-    local batch_id=$1 result=0 operation
-    remove_transaction_ufw_rules "$batch_id" || result=1
-    restore_transaction_snapshot "$batch_id" || result=1
-    restore_deleted_ufw_rules "$batch_id" || result=1
+    local batch_id=$1 result=0 operation rollback_errors=
+    prepare_failed_transaction_rollback "$batch_id"
+    remove_transaction_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '删除覆盖事务新增的 UFW 规则失败'); }
+    restore_transaction_snapshot "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复事务快照文件失败'); }
+    restore_deleted_ufw_rules "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '恢复被覆盖的 UFW 规则失败'); }
     operation=$(transaction_value "${TRANSACTION_DIR}/${batch_id}.txn" operation 2>/dev/null || true)
     if [[ "$operation" == restore ]]; then
-        reconcile_all_live_managed_nat_to_file "$BEFORE_RULES" || result=1
+        reconcile_all_live_managed_nat_to_file "$BEFORE_RULES" \
+            || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '重建运行时 NAT 失败'); }
     else
         sync_live_nat_marker_files_to_file "$BEFORE_RULES" \
             "${BACKUP_DIR}/${batch_id}/ufw-intended.txt" \
-            "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" || result=1
+            "${BACKUP_DIR}/${batch_id}/ufw-delete-intended.tsv" \
+            || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '同步运行时 NAT 失败'); }
     fi
-    verify_snapshot_restored "$batch_id" || result=1
-    verify_transaction_ufw_rules_absent "$batch_id" || result=1
-    verify_deleted_ufw_rules_restored "$batch_id" || result=1
+    verify_snapshot_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '事务快照恢复验证失败'); }
+    verify_transaction_ufw_rules_absent "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '覆盖事务新增 UFW 规则仍有残留'); }
+    verify_deleted_ufw_rules_restored "$batch_id" \
+        || { result=1; rollback_errors=$(append_rollback_error "$rollback_errors" '被覆盖 UFW 规则恢复验证失败'); }
     if (( result == 0 )); then
+        set_transaction_rollback_result "$batch_id" verified '' || true
         set_transaction_phase "$batch_id" rolled_back
         return 0
     fi
+    set_transaction_rollback_result "$batch_id" failed "$rollback_errors" || true
     protect_failed_transaction "$batch_id" rollback_failed '无法验证覆盖事务恢复'
     return 1
 }

@@ -275,6 +275,7 @@ UFW_FAIL_ADD_AT=0
 UFW_DELETE_COUNT=0
 UFW_FAIL_DELETE_AT=0
 UFW_SHOW_ADDED_OVERRIDE=
+UFW_FAIL_SHOW_ADDED_ONCE=0
 UFW_RELOAD_SYNC=1
 UFW_ACTIVE=1
 LIVE_NAT_FILE="$TEST_TMP/live-nat.rules"
@@ -293,7 +294,8 @@ ufw() {
         'status numbered')
             local marker proto index=1
             if (( ${#UFW_ADDED_MARKERS[@]} > 0 )); then
-                for marker in "${UFW_ADDED_MARKERS[@]}"; do
+                for marker in "${UFW_ADDED_MARKERS[@]-}"; do
+                    [[ -n "$marker" ]] || continue
                     proto=${marker##*:}
                     printf '[ %d] 10.0.0.2 52350/%s on eth1 ALLOW FWD Anywhere on eth0 # %s\n' \
                         "$index" "$proto" "$marker"
@@ -303,12 +305,17 @@ ufw() {
             return 0
             ;;
         'show added')
+            if (( UFW_FAIL_SHOW_ADDED_ONCE == 1 )); then
+                UFW_FAIL_SHOW_ADDED_ONCE=0
+                return 1
+            fi
             if [[ -n "$UFW_SHOW_ADDED_OVERRIDE" ]]; then
                 printf '%s\n' "$UFW_SHOW_ADDED_OVERRIDE"
                 return 0
             fi
             local marker proto
-            for marker in "${UFW_ADDED_MARKERS[@]}"; do
+            for marker in "${UFW_ADDED_MARKERS[@]-}"; do
+                [[ -n "$marker" ]] || continue
                 proto=${marker##*:}
                 # UFW 会省略默认来源 any，并将 proto 规范化到 port 后方。
                 printf "ufw route allow in on eth0 out on eth1 to 10.0.0.2 port 52350 proto %s comment '%s'\n" \
@@ -403,6 +410,17 @@ assert_file_contains "$BEFORE_RULES" 'lsec:batch-success:tcp:dnat'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:tcp\ttcp'
 assert_file_contains "$STATE_FILE" $'lsec:batch-success:udp\tudp'
 assert_file_contains "$TRANSACTION_DIR/batch-success.txn" $'phase\tcommitted'
+begin_transaction evidence-batch create tcp
+set_verification_failure verify_nat_live NAT_LIVE_DNAT_MISMATCH tcp lsec:batch-success:tcp \
+    '运行时 DNAT 规则与预期不一致' expected actual
+prepare_failed_transaction_rollback evidence-batch
+evidence_dir="$BACKUP_DIR/evidence-batch/failure"
+assert_file_contains "$evidence_dir/iptables-save-nat.txt" 'lsec:batch-success:tcp:dnat'
+assert_file_contains "$evidence_dir/verification.tsv" $'failure_code\tNAT_LIVE_DNAT_MISMATCH'
+assert_eq "$(file_mode "$evidence_dir")" 700
+assert_eq "$(file_mode "$evidence_dir/verification.tsv")" 600
+set_transaction_rollback_result evidence-batch verified ''
+set_transaction_phase evidence-batch rolled_back
 assert_status 0 verify_nat_marker_effective 'lsec:batch-success:tcp'
 cp "$STATE_FILE" "$TEST_TMP/state-before-drift"
 sed 's/\t52350\teth1/\t52351\teth1/' "$TEST_TMP/state-before-drift" > "$STATE_FILE"
@@ -603,9 +621,14 @@ original_apply_staged="$(declare -f apply_staged_nat_file)"
 prepare_create_failure_case batch-nat-fail
 apply_ipv4_forwarding_for_transaction() { return 0; }
 apply_staged_nat_file() { return 1; }
+UFW_FAIL_SHOW_ADDED_ONCE=1
 assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" create_forwarding_transaction \
     batch-nat-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 assert_eq "$(shasum -a 256 "$BEFORE_RULES" | awk '{print $1}')" "$FAILURE_BEFORE_HASH"
+assert_file_contains "$TRANSACTION_DIR/batch-nat-fail.txn" $'failure_code\tTRANSACTION_STEP_FAILED'
+assert_file_contains "$TRANSACTION_DIR/batch-nat-fail.txn" $'rollback_status\tverified'
+assert_file_contains "$TRANSACTION_DIR/batch-nat-fail.txn" 'ufw show added 采集失败'
+assert_file_contains "$BACKUP_DIR/batch-nat-fail/failure/before.rules.failed" '*filter'
 eval "$original_apply_staged"
 eval "$original_ipv4_apply"
 
@@ -647,6 +670,8 @@ restore_transaction_snapshot() { return 1; }
 assert_status "$RESULT_ROLLBACK_FAILED" create_forwarding_transaction \
     batch-rollback-fail "$FAILURE_STAGED" any eth0 52350 eth1 10.0.0.2 52350 yes tcp udp >/dev/null 2>&1
 assert_file_contains "$PROTECTED_LOCK" $'batch_id\tbatch-rollback-fail'
+assert_file_contains "$TRANSACTION_DIR/batch-rollback-fail.txn" $'rollback_status\tfailed'
+assert_file_contains "$TRANSACTION_DIR/batch-rollback-fail.txn" '恢复事务快照文件失败'
 assert_status "$RESULT_PROTECTED_LOCKOUT" require_mutation_allowed >/dev/null 2>&1
 eval "$original_apply_staged"
 eval "$original_restore_snapshot"
@@ -728,6 +753,8 @@ assert_eq "$(state_marker_count 'lsec:old-failure:tcp')" 1
 assert_eq "$(state_marker_count 'lsec:old-failure:udp')" 1
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified delete rollback created protected lock'
+assert_file_contains "$TRANSACTION_DIR/delete-failure-batch.txn" $'rollback_status\tverified'
+assert_file_contains "$BACKUP_DIR/delete-failure-batch/failure/verification.tsv" $'operation\tdelete'
 UFW_FAIL_DELETE_AT=0
 
 forward_delete_definition="$(declare -f delete_forward_rule_interactive_locked; declare -f delete_forward_rule_interactive)"
@@ -801,6 +828,8 @@ assert_eq "$(state_marker_count 'lsec:replace-fails:tcp')" 0
 assert_eq "${#UFW_ADDED_MARKERS[@]}" 2
 assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:tcp'
 assert_contains "${UFW_ADDED_MARKERS[*]}" 'lsec:replace-restore:udp'
+assert_file_contains "$TRANSACTION_DIR/replace-fails.txn" $'rollback_status\tverified'
+assert_file_contains "$BACKUP_DIR/replace-fails/failure/verification.tsv" $'operation\toverwrite'
 UFW_FAIL_ADD_AT=0
 
 eval "$original_verify_ipv4"
@@ -948,6 +977,8 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" enable_ufw_transaction ufw-fail
 assert_eq "$BOOT_UFW_ACTIVE" no
 assert_eq "${#BOOT_UFW_MARKERS[@]}" 0
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified UFW rollback created protected lock'
+assert_file_contains "$TRANSACTION_DIR/ufw-failure.txn" $'rollback_status\tverified'
+assert_file_contains "$BACKUP_DIR/ufw-failure/failure/verification.tsv" $'operation\tenable_ufw'
 BOOT_UFW_FAIL=
 eval "$original_confirm_ufw_activation"
 BOOT_UFW_MARKERS=('lsec:preview:ssh-2222')
@@ -1051,6 +1082,8 @@ assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" migrate_legacy_forwarding_state
 assert_contains "${BOOT_UFW_MARKERS[*]}" 'ufw-relay:legacy-fail'
 assert_not_contains "${BOOT_UFW_MARKERS[*]}" 'lsec:migration-fail:'
 [[ ! -e "$PROTECTED_LOCK" ]] || fail 'verified legacy rollback activated protected lock'
+assert_file_contains "$TRANSACTION_DIR/migration-fail.txn" $'rollback_status\tverified'
+assert_file_contains "$BACKUP_DIR/migration-fail/failure/verification.tsv" $'operation\tmigrate_legacy'
 eval "$original_add_forward_ufw_route"
 
 STATE_DIR="$TEST_TMP/backup-policy-state"
@@ -1112,6 +1145,21 @@ restore_snapshot_transaction restore-source
 assert_eq "$(cat "$BEFORE_RULES")" restore-point
 restore_journal=$(grep -l $'operation\trestore' "$TRANSACTION_DIR"/*.txn | head -1)
 assert_file_contains "$restore_journal" $'phase\tcommitted'
+original_reconcile_definition="$(declare -f reconcile_all_live_managed_nat_to_file)"
+eval "${original_reconcile_definition/reconcile_all_live_managed_nat_to_file/reconcile_all_live_managed_nat_to_file_original}"
+RESTORE_RECONCILE_COUNT=0
+reconcile_all_live_managed_nat_to_file() {
+    ((RESTORE_RECONCILE_COUNT += 1))
+    (( RESTORE_RECONCILE_COUNT > 1 )) || return 1
+    reconcile_all_live_managed_nat_to_file_original "$@"
+}
+assert_status "$RESULT_APPLY_FAILED_ROLLED_BACK" restore_snapshot_transaction restore-source
+restore_failed_journal=$(grep -l $'operation\trestore' "$TRANSACTION_DIR"/*.txn \
+    | xargs grep -l $'phase\trolled_back' | head -1)
+assert_file_contains "$restore_failed_journal" $'rollback_status\tverified'
+restore_failed_batch=$(transaction_value "$restore_failed_journal" batch_id)
+assert_file_contains "$BACKUP_DIR/$restore_failed_batch/failure/verification.tsv" $'operation\trestore'
+eval "$original_reconcile_definition"
 assert_contains "$(declare -f forward_menu)" 'transaction_maintenance_menu'
 
 assert_not_contains "$(declare -f forward_menu)" 'add_forward_rule_interactive || true'
