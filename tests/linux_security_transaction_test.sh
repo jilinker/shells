@@ -417,6 +417,55 @@ assert_status 1 delete_ufw_rules_by_comment 'lsec:prefix:tcp'
 UFW_ADDED_MARKERS=()
 UFW_DELETE_COUNT=0
 
+# SSH 迁移规则是一条持久化逻辑规则，但启用 IPv6 时可显示为两条编号规则。
+original_is_ufw_active=$(declare -f is_ufw_active)
+original_ufw_persistent_marker_count=$(declare -f ufw_persistent_marker_count)
+original_ufw_numbered_lines_for_marker=$(declare -f ufw_numbered_lines_for_marker)
+original_ufw=$(declare -f ufw)
+SSH_UFW_PERSISTENT_COUNT=1
+SSH_UFW_NUMBERED_LINES=$'[ 3] 22/tcp ALLOW IN Anywhere # security-manager-ssh-old-22\n[ 8] 22/tcp (v6) ALLOW IN Anywhere (v6) # security-manager-ssh-old-22'
+SSH_UFW_DELETE_ARGS=
+is_ufw_active() { return 0; }
+ufw_persistent_marker_count() { printf '%s\n' "$SSH_UFW_PERSISTENT_COUNT"; }
+ufw_numbered_lines_for_marker() { printf '%s\n' "$SSH_UFW_NUMBERED_LINES"; }
+ufw() {
+    SSH_UFW_DELETE_ARGS=$*
+    SSH_UFW_PERSISTENT_COUNT=0
+    SSH_UFW_NUMBERED_LINES=
+    return 0
+}
+delete_ssh_migration_ufw_rule 22 security-manager-ssh-old-22
+assert_eq '--force delete allow in proto tcp from any to any port 22 comment security-manager-ssh-old-22' "$SSH_UFW_DELETE_ARGS"
+assert_eq 0 "$SSH_UFW_PERSISTENT_COUNT"
+assert_eq '' "$SSH_UFW_NUMBERED_LINES"
+
+# 已不存在的迁移规则必须幂等成功，且不能执行任何模糊删除。
+SSH_UFW_DELETE_ARGS=
+delete_ssh_migration_ufw_rule 22 security-manager-ssh-old-22
+assert_eq '' "$SSH_UFW_DELETE_ARGS"
+
+# 预检接受一条持久化逻辑规则对应两条 IPv4/IPv6 展示行。
+SSH_UFW_PERSISTENT_COUNT=1
+SSH_UFW_NUMBERED_LINES=$'[ 3] 22/tcp ALLOW IN Anywhere # security-manager-ssh-old-22\n[ 8] 22/tcp (v6) ALLOW IN Anywhere (v6) # security-manager-ssh-old-22'
+preflight_ssh_migration_ufw_cleanup 22 security-manager-ssh-old-22
+
+# 多条持久化逻辑定义属于漂移，必须在 SSH 变更前拒绝。
+SSH_UFW_PERSISTENT_COUNT=2
+assert_status 1 preflight_ssh_migration_ufw_cleanup 22 security-manager-ssh-old-22
+assert_eq SSH_UFW_LOGICAL_RULE_DRIFT "$VERIFY_FAILURE_CODE"
+assert_contains "$VERIFY_FAILURE_ACTUAL" 'persistent_count=2'
+
+# 删除命令失败且规则仍存在时必须准确失败。
+SSH_UFW_PERSISTENT_COUNT=1
+ufw() { return 1; }
+assert_status 1 delete_ssh_migration_ufw_rule 22 security-manager-ssh-old-22
+assert_eq SSH_UFW_DELETE_FAILED "$VERIFY_FAILURE_CODE"
+
+eval "$original_is_ufw_active"
+eval "$original_ufw_persistent_marker_count"
+eval "$original_ufw_numbered_lines_for_marker"
+eval "$original_ufw"
+
 original_ipv4_apply="$(declare -f apply_ipv4_forwarding_for_transaction 2>/dev/null || true)"
 original_verify_ipv4="$(declare -f verify_ipv4_forwarding_effective)"
 apply_ipv4_forwarding_for_transaction() { return 0; }

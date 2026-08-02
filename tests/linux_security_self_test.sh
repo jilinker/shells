@@ -213,11 +213,84 @@ assert_contains "$with_recidive" 'bantime = 30d'
 
 # 模拟 UFW 清理结果
 delete_ssh_migration_ufw_rule() {
-    [[ "$1" != "fail" ]]
+    [[ "$2" != "fail" ]]
 }
 
-cleanup_ssh_migration_ufw_rules old new
-assert_fails cleanup_ssh_migration_ufw_rules old fail
+cleanup_ssh_migration_ufw_rules 22 old 2222 new
+assert_fails cleanup_ssh_migration_ufw_rules 22 old 2222 fail
+
+# 完成迁移已切换 SSH 运行时后，如果 UFW 清理失败，必须恢复原端口集合并返回准确结果。
+original_confirm=$(declare -f confirm)
+original_collect_ssh_config_files=$(declare -f collect_ssh_config_files)
+original_sshd=$(declare -f sshd 2>/dev/null || true)
+original_reload_ssh_runtime=$(declare -f reload_ssh_runtime)
+original_delete_ssh_migration_ufw_rule=$(declare -f delete_ssh_migration_ufw_rule)
+original_preflight_ssh_migration_ufw_cleanup=$(declare -f preflight_ssh_migration_ufw_cleanup)
+original_ssh_config_dir=$SSH_CONFIG_DIR
+original_ssh_main_config=$SSH_MAIN_CONFIG
+original_ssh_port_config=$SSH_PORT_CONFIG
+original_ssh_state_dir=$SSH_STATE_DIR
+original_ssh_port_state=$SSH_PORT_STATE
+original_ssh_socket_dropin=$SSH_SOCKET_DROPIN
+
+SSH_CONFIG_DIR="$TEST_TMP/ssh-finish/config.d"
+SSH_MAIN_CONFIG="$TEST_TMP/ssh-finish/sshd_config"
+SSH_PORT_CONFIG="$SSH_CONFIG_DIR/99-security-manager-port.conf"
+SSH_STATE_DIR="$TEST_TMP/ssh-finish/state"
+SSH_PORT_STATE="$SSH_STATE_DIR/port-migration.tsv"
+SSH_SOCKET_DROPIN="$TEST_TMP/ssh-finish/ssh.socket.conf"
+install -d -m 755 "$SSH_CONFIG_DIR" "$SSH_STATE_DIR"
+printf 'Include /etc/ssh/sshd_config.d/*.conf\n' > "$SSH_MAIN_CONFIG"
+printf 'Port 22\nPort 2222\n' > "$SSH_PORT_CONFIG"
+printf '22\t2222\tno\tsecurity-manager-ssh-old-22\tsecurity-manager-ssh-new-2222\n' > "$SSH_PORT_STATE"
+SSH_FINISH_RELOAD_LOG="$TEST_TMP/ssh-finish/reload.log"
+: > "$SSH_FINISH_RELOAD_LOG"
+confirm() { return 0; }
+collect_ssh_config_files() { return 0; }
+sshd() { [[ ${1:-} == -t ]]; }
+reload_ssh_runtime() { printf '%s\n' "$*" >> "$SSH_FINISH_RELOAD_LOG"; }
+preflight_ssh_migration_ufw_cleanup() { return 0; }
+delete_ssh_migration_ufw_rule() { return 1; }
+
+SSH_FINISH_OUTPUT="$TEST_TMP/ssh-finish/output.log"
+set +e
+finish_ssh_port_migration > "$SSH_FINISH_OUTPUT" 2>&1
+ssh_finish_result=$?
+set -e
+assert_eq "$RESULT_APPLY_FAILED_ROLLED_BACK" "$ssh_finish_result"
+assert_contains "$(cat "$SSH_FINISH_OUTPUT")" 'UFW 迁移规则清理失败，SSH 与 UFW 已验证回滚'
+assert_eq $'Port 22\nPort 2222' "$(cat "$SSH_PORT_CONFIG")"
+test -s "$SSH_PORT_STATE"
+assert_contains "$(cat "$SSH_FINISH_RELOAD_LOG")" 'no 2222'
+assert_contains "$(cat "$SSH_FINISH_RELOAD_LOG")" 'no 22 2222'
+
+# 兼容现场的部分完成状态：SSH 已仅保留新端口、旧 UFW 规则已不存在、状态文件仍在。
+printf 'Port 2222\n' > "$SSH_PORT_CONFIG"
+: > "$SSH_FINISH_RELOAD_LOG"
+preflight_ssh_migration_ufw_cleanup() { return 0; }
+delete_ssh_migration_ufw_rule() { return 0; }
+set +e
+finish_ssh_port_migration > "$SSH_FINISH_OUTPUT" 2>&1
+ssh_finish_result=$?
+set -e
+assert_eq "$RESULT_OK" "$ssh_finish_result"
+assert_eq 'Port 2222' "$(cat "$SSH_PORT_CONFIG")"
+assert_fails test -e "$SSH_PORT_STATE"
+assert_contains "$(cat "$SSH_FINISH_OUTPUT")" 'SSH 已迁移到端口 2222'
+assert_contains "$(cat "$SSH_FINISH_RELOAD_LOG")" 'no 2222'
+
+eval "$original_confirm"
+eval "$original_collect_ssh_config_files"
+if [[ -n "$original_sshd" ]]; then eval "$original_sshd"; else unset -f sshd; fi
+eval "$original_reload_ssh_runtime"
+eval "$original_delete_ssh_migration_ufw_rule"
+eval "$original_preflight_ssh_migration_ufw_cleanup"
+SSH_CONFIG_DIR=$original_ssh_config_dir
+SSH_MAIN_CONFIG=$original_ssh_main_config
+SSH_PORT_CONFIG=$original_ssh_port_config
+SSH_STATE_DIR=$original_ssh_state_dir
+SSH_PORT_STATE=$original_ssh_port_state
+SSH_SOCKET_DROPIN=$original_ssh_socket_dropin
 
 RED=
 GREEN=

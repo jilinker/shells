@@ -1187,6 +1187,8 @@ failure_stage_label() {
         applying_ufw) printf '应用 UFW 配置' ;;
         committing_state) printf '提交状态文件' ;;
         verifying) printf '应用后本机验证' ;;
+        ssh_ufw_preflight) printf 'SSH 迁移 UFW 前置检查' ;;
+        ssh_ufw_cleanup) printf 'SSH 迁移 UFW 清理' ;;
         *) printf '%s' "${1:-未知阶段}" ;;
     esac
 }
@@ -1959,19 +1961,161 @@ add_ssh_migration_ufw_rule() {
 
 # 删除 SSH 迁移防火墙规则
 delete_ssh_migration_ufw_rule() {
-    local comment=$1
+    local port=$1
+    local comment=$2
+    local persistent_count runtime_count
     command -v ufw >/dev/null 2>&1 && is_ufw_active || return 0
-    delete_ufw_rules_by_comment "$comment"
+    validate_port "$port" || return 1
+
+    if ! persistent_count=$(ufw_persistent_marker_count "$comment"); then
+        set_verification_failure ssh_ufw_cleanup SSH_UFW_PERSISTENT_READ_FAILED tcp "$comment" \
+            '无法读取 UFW 持久化规则' 'ufw show added succeeds' "port=${port}"
+        return 1
+    fi
+    if ! runtime_count=$(ufw_numbered_lines_for_marker "$comment" \
+        | awk 'NF {count++} END {print count + 0}'); then
+        set_verification_failure ssh_ufw_cleanup SSH_UFW_RUNTIME_READ_FAILED tcp "$comment" \
+            '无法读取 UFW 运行时规则' 'ufw status numbered succeeds' "port=${port}"
+        return 1
+    fi
+    if (( persistent_count == 0 && runtime_count == 0 )); then
+        return 0
+    fi
+    if (( persistent_count != 1 )); then
+        set_verification_failure ssh_ufw_cleanup SSH_UFW_LOGICAL_RULE_DRIFT tcp "$comment" \
+            '旧端口 UFW 逻辑规则数量异常' 'persistent_count=1' \
+            "persistent_count=${persistent_count} runtime_count=${runtime_count} port=${port}"
+        return 1
+    fi
+
+    if ! ufw --force delete allow in proto tcp from any to any port "$port" comment "$comment"; then
+        set_verification_failure ssh_ufw_cleanup SSH_UFW_DELETE_FAILED tcp "$comment" \
+            'UFW 拒绝删除旧 SSH 端口逻辑规则' \
+            "ufw delete allow in proto tcp from any to any port ${port} comment ${comment}" \
+            'command_failed'
+        return 1
+    fi
+    persistent_count=$(ufw_persistent_marker_count "$comment") || return 1
+    runtime_count=$(ufw_numbered_lines_for_marker "$comment" \
+        | awk 'NF {count++} END {print count + 0}') || return 1
+    if (( persistent_count != 0 || runtime_count != 0 )); then
+        set_verification_failure ssh_ufw_cleanup SSH_UFW_RULE_RESIDUAL tcp "$comment" \
+            '删除后仍存在旧 SSH 端口 UFW 规则' 'persistent_count=0 runtime_count=0' \
+            "persistent_count=${persistent_count} runtime_count=${runtime_count} port=${port}"
+        return 1
+    fi
+    return 0
 }
 
 # 清理 SSH 迁移防火墙规则
 cleanup_ssh_migration_ufw_rules() {
-    local old_comment=$1
-    local new_comment=$2
+    local old_port=$1
+    local old_comment=$2
+    local new_port=$3
+    local new_comment=$4
     local failed=0
-    delete_ssh_migration_ufw_rule "$old_comment" || failed=1
-    delete_ssh_migration_ufw_rule "$new_comment" || failed=1
+    delete_ssh_migration_ufw_rule "$old_port" "$old_comment" || failed=1
+    delete_ssh_migration_ufw_rule "$new_port" "$new_comment" || failed=1
     return "$failed"
+}
+
+# 检查待清理的 SSH UFW 逻辑规则；一条逻辑规则可对应 IPv4/IPv6 多条展示行。
+preflight_ssh_migration_ufw_cleanup() {
+    local port=$1
+    local comment=$2
+    local persistent_count runtime_count
+    command -v ufw >/dev/null 2>&1 && is_ufw_active || return 0
+    validate_port "$port" || return 1
+    if ! persistent_count=$(ufw_persistent_marker_count "$comment"); then
+        set_verification_failure ssh_ufw_preflight SSH_UFW_PERSISTENT_READ_FAILED tcp "$comment" \
+            '无法读取 UFW 持久化规则' 'ufw show added succeeds' "port=${port}"
+        return 1
+    fi
+    if ! runtime_count=$(ufw_numbered_lines_for_marker "$comment" \
+        | awk 'NF {count++} END {print count + 0}'); then
+        set_verification_failure ssh_ufw_preflight SSH_UFW_RUNTIME_READ_FAILED tcp "$comment" \
+            '无法读取 UFW 运行时规则' 'ufw status numbered succeeds' "port=${port}"
+        return 1
+    fi
+    if (( persistent_count == 0 && runtime_count == 0 )); then
+        return 0
+    fi
+    if (( persistent_count == 1 && runtime_count > 0 )); then
+        return 0
+    fi
+    set_verification_failure ssh_ufw_preflight SSH_UFW_LOGICAL_RULE_DRIFT tcp "$comment" \
+        '旧端口 UFW 逻辑规则状态不一致' \
+        'persistent_count=0 runtime_count=0 or persistent_count=1 runtime_count>=1' \
+        "persistent_count=${persistent_count} runtime_count=${runtime_count} port=${port}"
+    return 1
+}
+
+# 恢复迁移前由脚本创建的旧 SSH TCP 放行规则。
+restore_ssh_migration_ufw_rule() {
+    local port=$1
+    local comment=$2
+    local persistent_count runtime_count
+    command -v ufw >/dev/null 2>&1 && is_ufw_active || return 0
+    persistent_count=$(ufw_persistent_marker_count "$comment") || return 1
+    if (( persistent_count == 0 )); then
+        add_inbound_allow_rule "$port" tcp "$comment" || return 1
+    elif (( persistent_count != 1 )); then
+        return 1
+    fi
+    persistent_count=$(ufw_persistent_marker_count "$comment") || return 1
+    runtime_count=$(ufw_numbered_lines_for_marker "$comment" \
+        | awk 'NF {count++} END {print count + 0}') || return 1
+    (( persistent_count == 1 && runtime_count > 0 ))
+}
+
+verify_restored_file() {
+    local target=$1
+    local backup=${2:-}
+    if [[ -n "$backup" && -e "$backup" ]]; then
+        cmp -s "$backup" "$target"
+    else
+        [[ ! -e "$target" ]]
+    fi
+}
+
+# 恢复完成迁移前的 SSH 文件和监听配置。
+rollback_ssh_port_finish() {
+    local port_backup=$1
+    local socket_backup=$2
+    local socket_managed=$3
+    local old_port=$4
+    local new_port=$5
+    shift 5
+    local index failed=0
+    local -a changed_files_ref=()
+    local -a changed_backups_ref=()
+
+    while (( $# >= 2 )); do
+        changed_files_ref+=("$1")
+        changed_backups_ref+=("$2")
+        shift 2
+    done
+    (( $# == 0 )) || return 1
+
+    restore_file "$SSH_PORT_CONFIG" "$port_backup" || failed=1
+    if [[ "$socket_managed" == "yes" ]]; then
+        restore_file "$SSH_SOCKET_DROPIN" "$socket_backup" || failed=1
+    fi
+    for (( index=0; index<${#changed_files_ref[@]}; index++ )); do
+        restore_file "${changed_files_ref[$index]}" "${changed_backups_ref[$index]}" || failed=1
+    done
+
+    verify_restored_file "$SSH_PORT_CONFIG" "$port_backup" || failed=1
+    if [[ "$socket_managed" == "yes" ]]; then
+        verify_restored_file "$SSH_SOCKET_DROPIN" "$socket_backup" || failed=1
+    fi
+    for (( index=0; index<${#changed_files_ref[@]}; index++ )); do
+        verify_restored_file "${changed_files_ref[$index]}" "${changed_backups_ref[$index]}" || failed=1
+    done
+    sshd -t >/dev/null 2>&1 \
+        && reload_ssh_runtime "$socket_managed" "$old_port" "$new_port" >/dev/null 2>&1 \
+        || failed=1
+    (( failed == 0 ))
 }
 
 # 保存 SSH 端口迁移状态
@@ -1995,6 +2139,7 @@ rollback_ssh_port_start() {
     local old_comment=$5
     local new_comment=$6
     local old_port=$7
+    local new_port=$8
     local failed=0
 
     restore_file "$SSH_PORT_CONFIG" "$port_backup"
@@ -2002,7 +2147,7 @@ rollback_ssh_port_start() {
     if [[ "$socket_managed" == "yes" ]]; then
         restore_file "$SSH_SOCKET_DROPIN" "$socket_backup"
     fi
-    cleanup_ssh_migration_ufw_rules "$old_comment" "$new_comment" || failed=1
+    cleanup_ssh_migration_ufw_rules "$old_port" "$old_comment" "$new_port" "$new_comment" || failed=1
     sshd -t >/dev/null 2>&1 && reload_ssh_runtime "$socket_managed" "$old_port" >/dev/null 2>&1 || failed=1
     (( failed == 0 )) || warn "SSH 配置已回滚但部分运行状态或 UFW 规则需要手工检查"
     return "$failed"
@@ -2059,26 +2204,26 @@ start_ssh_port_migration() {
     if ! add_ssh_migration_ufw_rule "$old_port" "$old_comment" \
         || ! add_ssh_migration_ufw_rule "$new_port" "$new_comment" \
         || ! write_managed_content "$SSH_PORT_CONFIG" 600 "$(render_ssh_ports "$old_port" "$new_port")"; then
-        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" || true
+        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" "$new_port" || true
         error "SSH 端口迁移准备失败并已回滚"
         return 1
     fi
 
     if [[ "$socket_managed" == "yes" ]] \
         && ! write_managed_content "$SSH_SOCKET_DROPIN" 644 "$(render_ssh_socket_ports "$old_port" "$new_port")"; then
-        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" || true
+        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" "$new_port" || true
         error "ssh.socket 配置失败并已回滚"
         return 1
     fi
 
     if ! sshd -t || ! reload_ssh_runtime "$socket_managed" "$old_port" "$new_port"; then
-        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" || true
+        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" "$new_port" || true
         error "SSH 端口迁移启动失败并已回滚"
         return 1
     fi
 
     if ! save_ssh_port_state "$old_port" "$new_port" "$socket_managed" "$old_comment" "$new_comment"; then
-        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" || true
+        rollback_ssh_port_start "$include_backup" "$port_backup" "${socket_backup:-}" "$socket_managed" "$old_comment" "$new_comment" "$old_port" "$new_port" || true
         error "SSH 端口迁移状态保存失败并已回滚"
         return 1
     fi
@@ -2099,24 +2244,34 @@ finish_ssh_port_migration() {
     local old_port new_port socket_managed old_comment new_comment
     local port_backup socket_backup file backup tmp mode index
     local operation_failed=0
-    local -a changed_files=()
-    local -a changed_backups=()
+    local -a changed_file_backups=()
 
-    [[ -s "$SSH_PORT_STATE" ]] || { info "当前没有待完成的端口迁移"; return 0; }
+    clear_verification_failure
+    [[ -s "$SSH_PORT_STATE" ]] || { info "当前没有待完成的端口迁移"; return "$RESULT_OK"; }
     IFS=$'\t' read -r old_port new_port socket_managed old_comment new_comment < "$SSH_PORT_STATE"
-    validate_port "$old_port" && validate_port "$new_port" || { error "端口迁移状态无效"; return 1; }
+    validate_port "$old_port" && validate_port "$new_port" || {
+        error "端口迁移状态无效"
+        return "$RESULT_PRECHECK_FAILED"
+    }
 
     warn "仅在新端口 ${new_port} 已通过独立 SSH 会话验证后继续"
-    confirm "确认关闭旧 SSH 端口 ${old_port}？" N || return 0
+    confirm "确认关闭旧 SSH 端口 ${old_port}？" N || return "$RESULT_CANCELLED"
+
+    if ! preflight_ssh_migration_ufw_cleanup "$old_port" "$old_comment"; then
+        error "无法确认旧端口 UFW 迁移规则状态，未修改 SSH"
+        warn "仅允许 0 条或 1 条持久化逻辑规则；IPv4/IPv6 多行展示属于同一逻辑规则"
+        render_current_verification_failure_details >&2 || true
+        return "$RESULT_PRECHECK_FAILED"
+    fi
 
     if ! port_backup=$(backup_file "$SSH_PORT_CONFIG"); then
         error "SSH 端口配置备份失败"
-        return 1
+        return "$RESULT_PRECHECK_FAILED"
     fi
     if [[ "$socket_managed" == "yes" ]]; then
         if ! socket_backup=$(backup_file "$SSH_SOCKET_DROPIN"); then
             error "ssh.socket 配置备份失败"
-            return 1
+            return "$RESULT_PRECHECK_FAILED"
         fi
     fi
 
@@ -2136,8 +2291,7 @@ finish_ssh_port_migration() {
                 break
             fi
             rm -f "$tmp"
-            changed_files+=("$file")
-            changed_backups+=("$backup")
+            changed_file_backups+=("$file" "$backup")
         fi
     done < <(collect_ssh_config_files)
 
@@ -2151,36 +2305,50 @@ finish_ssh_port_migration() {
     fi
 
     if (( operation_failed == 1 )); then
-        restore_file "$SSH_PORT_CONFIG" "$port_backup"
-        [[ "$socket_managed" == "yes" ]] && restore_file "$SSH_SOCKET_DROPIN" "${socket_backup:-}"
-        for (( index=0; index<${#changed_files[@]}; index++ )); do
-            restore_file "${changed_files[$index]}" "${changed_backups[$index]}"
-        done
-        error "SSH 端口配置写入失败并已回滚"
-        return 1
+        if rollback_ssh_port_finish "$port_backup" "${socket_backup:-}" "$socket_managed" \
+            "$old_port" "$new_port" ${changed_file_backups[@]+"${changed_file_backups[@]}"}; then
+            error "SSH 端口配置写入失败，已验证回滚"
+            return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        fi
+        error "SSH 端口配置写入失败且回滚无法验证，需要手工修复"
+        return "$RESULT_REPAIR_REQUIRED"
     fi
 
     if ! sshd -t || ! reload_ssh_runtime "$socket_managed" "$new_port"; then
-        restore_file "$SSH_PORT_CONFIG" "$port_backup"
-        [[ "$socket_managed" == "yes" ]] && restore_file "$SSH_SOCKET_DROPIN" "${socket_backup:-}"
-        for (( index=0; index<${#changed_files[@]}; index++ )); do
-            restore_file "${changed_files[$index]}" "${changed_backups[$index]}"
-        done
-        sshd -t >/dev/null 2>&1 && reload_ssh_runtime "$socket_managed" "$old_port" "$new_port" >/dev/null 2>&1 || true
-        error "关闭旧 SSH 端口失败并已回滚"
-        return 1
+        if rollback_ssh_port_finish "$port_backup" "${socket_backup:-}" "$socket_managed" \
+            "$old_port" "$new_port" ${changed_file_backups[@]+"${changed_file_backups[@]}"}; then
+            error "关闭旧 SSH 端口失败，已验证回滚"
+            return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        fi
+        error "关闭旧 SSH 端口失败且回滚无法验证，需要手工修复"
+        return "$RESULT_REPAIR_REQUIRED"
     fi
 
-    if ! delete_ssh_migration_ufw_rule "$old_comment"; then
-        error "旧端口已关闭但 UFW 迁移规则清理失败"
-        warn "请修复 UFW 后重新执行完成迁移"
-        return 1
+    if ! delete_ssh_migration_ufw_rule "$old_port" "$old_comment"; then
+        render_current_verification_failure_details >&2 || true
+        restore_ssh_migration_ufw_rule "$old_port" "$old_comment" || operation_failed=1
+        if rollback_ssh_port_finish "$port_backup" "${socket_backup:-}" "$socket_managed" \
+            "$old_port" "$new_port" ${changed_file_backups[@]+"${changed_file_backups[@]}"} \
+            && (( operation_failed == 0 )); then
+            error "UFW 迁移规则清理失败，SSH 与 UFW 已验证回滚"
+            return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        fi
+        error "UFW 迁移规则清理失败且回滚无法验证，需要手工修复"
+        return "$RESULT_REPAIR_REQUIRED"
     fi
     if ! rm -f "$SSH_PORT_STATE"; then
-        error "SSH 迁移已生效但状态文件清理失败"
-        return 1
+        restore_ssh_migration_ufw_rule "$old_port" "$old_comment" || operation_failed=1
+        if rollback_ssh_port_finish "$port_backup" "${socket_backup:-}" "$socket_managed" \
+            "$old_port" "$new_port" ${changed_file_backups[@]+"${changed_file_backups[@]}"} \
+            && (( operation_failed == 0 )); then
+            error "SSH 迁移状态文件清理失败，SSH 与 UFW 已验证回滚"
+            return "$RESULT_APPLY_FAILED_ROLLED_BACK"
+        fi
+        error "SSH 迁移状态文件清理失败且回滚无法验证，需要手工修复"
+        return "$RESULT_REPAIR_REQUIRED"
     fi
     ok "SSH 已迁移到端口 ${new_port}"
+    return "$RESULT_OK"
 }
 
 # 检查 Fail2Ban 管理环境
